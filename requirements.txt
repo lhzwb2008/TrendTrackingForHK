@@ -1,0 +1,7 @@
+pandas>=2.0.0
+numpy>=1.24.0
+longport>=1.0.0
+schedule>=1.2.0
+matplotlib>=3.7.0
+seaborn>=0.12.0
+python-dotenv>=1.0.0 
