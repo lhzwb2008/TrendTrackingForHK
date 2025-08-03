@@ -25,137 +25,145 @@ logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 @dataclass
-class IntradayTrade:
-    """日内交易记录"""
-    date: date
+class DailyTrade:
+    """日级别交易记录"""
+    entry_date: date
+    exit_date: date
     symbol: str
-    entry_time: str  # 进场时间
-    exit_time: str   # 出场时间
     entry_price: float
     exit_price: float
     quantity: int
     pnl: float
     pnl_percent: float
-    exit_reason: str  # 止盈/止损/收盘清仓
+    exit_reason: str  # 止盈/止损/时间止损
     max_profit: float  # 最大盈利
     max_loss: float    # 最大亏损
-    hold_minutes: int  # 持仓分钟数
+    hold_days: int     # 持仓天数
 
-class IntradayReversalStrategy:
-    """日内反弹策略"""
+class DailyReversalStrategy:
+    """日级别暴跌反弹策略（支持多日持仓）"""
     
     def __init__(self):
         """初始化策略"""
-        self.config = Config.from_env()
-        self.quote_ctx = QuoteContext(self.config)
+        # ========================================
+        # 📊 策略配置中心 - 所有参数集中管理
+        # ========================================
         
-        # 资金管理
-        self.initial_capital = 100000     # 初始资金10万港币
-        self.current_capital = self.initial_capital
-        self.use_full_position = True     # 全仓操作
-        
-        # 目标股票
+        # 🎯 目标股票配置
         self.target_symbol = "9988.HK"  # 阿里巴巴
         
-        # 回测时间配置
-        self.default_start_date = date(2024, 1, 1)
-        self.default_end_date = date(2025, 1, 1)
+        # 📅 回测时间配置
+        self.backtest_start_date = date(2024, 1, 1)   # 回测开始日期
+        self.backtest_end_date = date(2024, 12, 31)   # 回测结束日期
         
-        # 策略参数
-        self.min_drop_percent = 0.03      # 最小跌幅3%触发关注
-        self.reversal_confirm_percent = 0.005  # 反弹确认0.5%
-        self.stop_loss_percent = 0.02     # 止损2%
-        self.take_profit_percent = 0.05   # 止盈5%
+        # 💰 资金管理配置
+        self.initial_capital = 100000     # 初始资金10万港币
+        self.use_full_position = True     # 全仓操作
+        self.max_position_ratio = 0.95   # 最大仓位比例95%
         
-        # 交易成本
+        # 📈 核心策略参数（最优配置）
+        self.min_drop_percent = 0.05      # 最小回撤5%触发关注（从20日高点）
+        self.severe_drop_percent = 0.07   # 严重回撤7%（更强信号，从20日高点）
+        self.stop_loss_percent = 0.08     # 止损8%（放宽止损，避免周末跳空被误杀）
+        self.take_profit_percent = 0.20   # 止盈20%（提高目标，适合持仓过周）
+        
+        # ⏰ 持仓时间控制
+        self.max_hold_days = 21           # 最大持仓天数3周（支持持仓过周）
+        self.min_hold_days = 2            # 最小持仓天数2天（避免过于频繁交易）
+        self.weekend_hold_enabled = True  # 允许持仓过周末
+        
+        # 📊 成交量确认参数
+        self.min_volume_surge = 1.5       # 最小成交量放大1.5倍
+        self.severe_volume_surge = 2.0    # 严重回撤时成交量放大2倍
+        
+        # 🛡️ 风险控制参数
+        self.trailing_stop_enabled = True # 启用移动止损
+        self.trailing_stop_percent = 0.06 # 移动止损6%（从最高点回撤）
+        
+        # 💸 交易成本配置
         self.commission_rate = 0.0025     # 佣金费率0.25%
         self.stamp_duty_rate = 0.001      # 印花税0.1%（仅卖出）
         self.min_commission = 3.0         # 最低佣金3港币
         
-        # 风险控制
-        self.max_position_ratio = 0.95   # 最大仓位比例95%
-        
-        # 时间控制
-        self.market_open = time(9, 30)    # 开盘时间
-        self.market_close = time(16, 0)   # 收盘时间
-        self.force_close_time = time(15, 45)  # 强制平仓时间
-        self.min_hold_minutes = 5         # 最小持仓时间5分钟
-        
-        # 成交量确认
-        self.min_volume_surge = 1.5       # 最小成交量放大1.5倍
+        # ========================================
+        # 系统初始化（无需修改）
+        # ========================================
+        self.config = Config.from_env()
+        self.quote_ctx = QuoteContext(self.config)
+        self.current_capital = self.initial_capital
+        self.default_start_date = self.backtest_start_date
+        self.default_end_date = self.backtest_end_date
         
         # 交易记录
-        self.trades: List[IntradayTrade] = []
+        self.trades: List[DailyTrade] = []
         self.current_position = None
         self.daily_stats = []
         
-    def get_intraday_data(self, symbol: str, target_date: date) -> pd.DataFrame:
-        """获取指定日期的真实分钟级数据"""
-        try:
-            # 直接获取分钟级历史数据
-            candles = self.quote_ctx.history_candlesticks_by_date(
-                symbol,
-                Period.Min_1,  # 1分钟级别
-                AdjustType.ForwardAdjust,
-                target_date,
-                target_date
-            )
-            
-            if not candles:
-                logger.warning(f"无法获取{symbol}在{target_date}的分钟级数据")
-                return pd.DataFrame()
-            
-            # 转换为DataFrame
-            data = []
-            for candle in candles:
-                # 处理时间戳（可能是datetime对象或时间戳）
-                if isinstance(candle.timestamp, datetime):
-                    timestamp = candle.timestamp
-                else:
-                    timestamp = datetime.fromtimestamp(candle.timestamp)
+    def get_daily_data(self, symbol: str, start_date: date, end_date: date, max_retries: int = 3) -> pd.DataFrame:
+        """获取指定日期范围的日线数据（带重试机制）"""
+        for attempt in range(max_retries):
+            try:
+                # 获取日线历史数据
+                candles = self.quote_ctx.history_candlesticks_by_date(
+                    symbol,
+                    Period.Day,  # 日线级别
+                    AdjustType.ForwardAdjust,
+                    start_date,
+                    end_date
+                )
                 
-                # 只保留交易时间内的数据（9:30-16:00，排除12:00-13:00午休）
-                if not self._is_trading_time(timestamp.time()):
+                if not candles:
+                    if attempt < max_retries - 1:
+                        logger.warning(f"第{attempt + 1}次尝试：无法获取{symbol}的日线数据，将重试...")
+                        time_module.sleep(1)  # 等待1秒后重试
+                        continue
+                    else:
+                        logger.debug(f"无法获取{symbol}的日线数据")
+                        return pd.DataFrame()
+                
+                # 成功获取数据，跳出重试循环
+                break
+                
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    logger.warning(f"第{attempt + 1}次尝试获取{symbol}的日线数据失败: {e}，将重试...")
+                    time_module.sleep(2)  # 等待2秒后重试
                     continue
-                    
-                data.append({
-                    'datetime': timestamp,
-                    'open': float(candle.open),
-                    'high': float(candle.high),
-                    'low': float(candle.low),
-                    'close': float(candle.close),
-                    'volume': int(candle.volume),
-                    'turnover': float(candle.turnover)
-                })
-            
-            if not data:
-                logger.warning(f"{symbol}在{target_date}没有交易时间内的数据")
-                return pd.DataFrame()
-            
-            df = pd.DataFrame(data)
-            df.set_index('datetime', inplace=True)
-            
-            # 计算技术指标
-            df = self.calculate_intraday_indicators(df)
-            
-            logger.info(f"成功获取{symbol}在{target_date}的{len(df)}条分钟级数据")
-            return df
-            
-        except Exception as e:
-            logger.error(f"获取{symbol}在{target_date}的数据失败: {e}")
+                else:
+                    logger.debug(f"获取{symbol}的日线数据失败: {e}")
+                    return pd.DataFrame()
+        
+        # 转换为DataFrame
+        data = []
+        for candle in candles:
+            # 处理时间戳（可能是datetime对象或时间戳）
+            if isinstance(candle.timestamp, datetime):
+                timestamp = candle.timestamp
+            else:
+                timestamp = datetime.fromtimestamp(candle.timestamp)
+                
+            data.append({
+                'date': timestamp.date(),
+                'open': float(candle.open),
+                'high': float(candle.high),
+                'low': float(candle.low),
+                'close': float(candle.close),
+                'volume': int(candle.volume),
+                'turnover': float(candle.turnover)
+            })
+        
+        if not data:
+            logger.warning(f"{symbol}没有日线数据")
             return pd.DataFrame()
-    
-    def _is_trading_time(self, time_obj: time) -> bool:
-        """判断是否为交易时间"""
-        # 上午：9:30-12:00
-        morning_start = time(9, 30)
-        morning_end = time(12, 0)
         
-        # 下午：13:00-16:00
-        afternoon_start = time(13, 0)
-        afternoon_end = time(16, 0)
+        df = pd.DataFrame(data)
+        df.set_index('date', inplace=True)
         
-        return (morning_start <= time_obj < morning_end) or (afternoon_start <= time_obj <= afternoon_end)
+        # 计算技术指标
+        df = self.calculate_daily_indicators(df)
+        
+        logger.info(f"成功获取{symbol}的{len(df)}条日线数据")
+        return df
     
 
     
@@ -163,12 +171,12 @@ class IntradayReversalStrategy:
     
 
     
-    def calculate_intraday_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """计算日内技术指标（避免未来函数）"""
-        if len(df) < 10:
+    def calculate_daily_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+        """计算日线技术指标（避免未来函数）"""
+        if len(df) < 20:
             return df
         
-        # 短期移动平均（使用shift确保不使用当前值）
+        # 移动平均（使用shift确保不使用当前值）
         df['ma5'] = df['close'].shift(1).rolling(5, min_periods=5).mean()
         df['ma10'] = df['close'].shift(1).rolling(10, min_periods=10).mean()
         df['ma20'] = df['close'].shift(1).rolling(20, min_periods=20).mean()
@@ -177,69 +185,94 @@ class IntradayReversalStrategy:
         df['volume_ma10'] = df['volume'].shift(1).rolling(10, min_periods=10).mean()
         df['volume_surge'] = df['volume'] / df['volume_ma10']
         
-        # 价格变化（基于前一分钟）
+        # 价格变化（基于前一日）
         df['price_change'] = df['close'].pct_change()
-        df['price_change_5min'] = df['close'].pct_change(5)
+        df['price_change_3d'] = df['close'].pct_change(3)
         
-        # 从开盘的累计涨跌幅（使用当日开盘价）
-        first_price = df['open'].iloc[0]  # 使用开盘价而不是第一个收盘价
-        df['cumulative_return'] = (df['close'] / first_price - 1)
+        # 日内振幅
+        df['daily_amplitude'] = (df['high'] - df['low']) / df['open']
         
-        # 振幅（基于前一分钟收盘价）
-        df['amplitude'] = (df['high'] - df['low']) / df['close'].shift(1)
+        # 相对前期高点的回撤
+        df['high_20d'] = df['high'].shift(1).rolling(20, min_periods=20).max()
+        df['drawdown_from_high'] = (df['close'] / df['high_20d'] - 1)
         
         return df
     
     def check_drop_signal(self, df: pd.DataFrame, current_idx: int) -> Tuple[bool, float]:
-        """检查大跌信号（避免未来函数）"""
+        """检查暴跌信号（基于最高点回撤，避免未来函数）"""
         if current_idx < 20:  # 需要足够的历史数据
             return False, 0.0
         
         current_data = df.iloc[current_idx]
         
-        # 检查从开盘的累计跌幅（使用当前已知价格）
-        cumulative_drop = current_data['cumulative_return']
+        # 检查从最高点的回撤幅度
+        drawdown = current_data['drawdown_from_high']
         
-        # 大跌条件：累计跌幅超过阈值
-        if cumulative_drop <= -self.min_drop_percent:
+        # 暴跌条件：从最高点回撤超过阈值
+        if pd.notna(drawdown) and drawdown <= -self.min_drop_percent:
+            # 根据回撤程度确定所需的成交量放大倍数
+            required_volume_surge = self.min_volume_surge
+            if drawdown <= -self.severe_drop_percent:
+                required_volume_surge = self.severe_volume_surge
+                logger.info(f"检测到严重回撤 {abs(drawdown):.2%}（从20日高点），要求成交量放大{required_volume_surge}倍")
+            
             # 确认成交量放大（使用历史平均成交量比较）
-            if pd.notna(current_data['volume_surge']) and current_data['volume_surge'] >= self.min_volume_surge:
-                return True, abs(cumulative_drop)
+            if pd.notna(current_data['volume_surge']) and current_data['volume_surge'] >= required_volume_surge:
+                return True, abs(drawdown)
+            else:
+                logger.debug(f"回撤{abs(drawdown):.2%}但成交量放大不足：{current_data.get('volume_surge', 0):.1f}倍 < {required_volume_surge}倍")
         
         return False, 0.0
     
     def check_reversal_signal(self, df: pd.DataFrame, current_idx: int) -> Tuple[bool, str]:
-        """检查反弹信号（避免未来函数）"""
+        """检查反弹信号（日线级别，避免未来函数）"""
         if current_idx < 20:  # 需要更多历史数据确保MA计算有效
             return False, ""
         
         current_data = df.iloc[current_idx]
         prev_data = df.iloc[current_idx - 1]
         
-        # 反弹确认条件
+        # 反弹确认条件（日线级别，适度放宽以增加交易机会）
         conditions = []
         
-        # 1. 价格开始回升
-        if current_data['price_change'] > self.reversal_confirm_percent:
-            conditions.append("价格回升")
+        # 1. 当日反弹幅度确认（降低门槛）
+        if current_data['price_change'] > 0.01:  # 当日上涨超过1%
+            conditions.append("反弹")
+        elif current_data['price_change'] > 0.005:  # 当日上涨超过0.5%
+            conditions.append("微反弹")
         
-        # 2. 突破短期均线（确保MA值有效）
-        if (pd.notna(current_data['ma5']) and pd.notna(prev_data['ma5']) and
-            current_data['close'] > current_data['ma5'] and 
-            prev_data['close'] <= prev_data['ma5']):
-            conditions.append("突破MA5")
+        # 2. 突破短期均线或接近均线
+        if pd.notna(current_data['ma5']):
+            if current_data['close'] > current_data['ma5']:
+                conditions.append("突破MA5")
+            elif current_data['close'] > current_data['ma5'] * 0.98:  # 接近MA5（2%以内）
+                conditions.append("接近MA5")
         
-        # 3. 成交量配合（确保volume_surge有效）
-        if pd.notna(current_data['volume_surge']) and current_data['volume_surge'] > 1.2:
-            conditions.append("成交量配合")
+        # 3. 成交量配合（降低要求）
+        if pd.notna(current_data['volume_surge']):
+            if current_data['volume_surge'] > 1.2:  # 降低至1.2倍
+                conditions.append("成交量配合")
+            elif current_data['volume_surge'] > 1.0:  # 成交量正常
+                conditions.append("成交量正常")
         
-        # 4. 技术面改善（连续2分钟上涨）
+        # 4. 相对高点回撤后反弹（放宽条件）
+        if (pd.notna(current_data['drawdown_from_high']) and 
+            current_data['drawdown_from_high'] < -0.05 and  # 相对20日高点回撤超过5%
+            current_data['price_change'] > 0.005):  # 当日反弹超过0.5%
+            conditions.append("回撤反弹")
+        
+        # 5. 日内振幅较大（降低门槛）
+        if current_data['daily_amplitude'] > 0.03:  # 日内振幅超过3%
+            conditions.append("高振幅")
+        
+        # 6. 连续下跌后的反弹（新增条件）
         if (current_idx >= 2 and 
-            current_data['price_change'] > 0 and 
-            df.iloc[current_idx - 1]['price_change'] > 0):
-            conditions.append("连续上涨")
+            df.iloc[current_idx-1]['price_change'] < 0 and 
+            df.iloc[current_idx-2]['price_change'] < 0 and
+            current_data['price_change'] > 0):
+            conditions.append("连跌反弹")
         
-        # 至少满足2个条件
+        # 至少满足2个条件（保持质量控制）
         if len(conditions) >= 2:
             return True, "; ".join(conditions)
         
@@ -286,264 +319,214 @@ class IntradayReversalStrategy:
         
         return 0
     
-    def simulate_trading_day(self, target_date: date) -> Dict:
-        """模拟单日交易"""
-        # 获取日内数据
-        df = self.get_intraday_data(self.target_symbol, target_date)
-        if df.empty:
-            return {'date': target_date, 'trades': 0, 'pnl': 0, 'capital': self.current_capital}
+    def process_trading_day(self, df: pd.DataFrame, current_idx: int) -> Dict:
+        """处理单个交易日的逻辑"""
+        current_date = df.index[current_idx]
+        current_data = df.iloc[current_idx]
+        current_price = current_data['close']
         
-        # 交易状态
-        position = None
-        daily_trades = []
-        looking_for_drop = True
-        drop_detected = False
+        result = {
+            'date': current_date,
+            'action': 'hold',
+            'signal_type': '',
+            'price': current_price,
+            'trade': None
+        }
         
-        # 遍历分钟数据
-        for i in range(len(df)):
-            current_time = df.index[i]
-            current_data = df.iloc[i]
-            current_price = current_data['close']
+        # 如果没有持仓，检查买入信号
+        if not self.current_position:
+            # 检查暴跌信号
+            drop_detected, drop_percent = self.check_drop_signal(df, current_idx)
+            if drop_detected:
+                # 检查反弹信号（可以是同一天或后续几天）
+                reversal_detected, reversal_reason = self.check_reversal_signal(df, current_idx)
+                if reversal_detected:
+                    # 买入
+                    quantity = self.calculate_position_size(current_price)
+                    buy_cost = self.calculate_trading_cost(current_price, quantity, True)
+                    
+                    if self.current_capital >= current_price * quantity + buy_cost:
+                        self.current_position = {
+                            'entry_date': current_date,
+                            'entry_price': current_price,
+                            'quantity': quantity,
+                            'buy_cost': buy_cost,
+                            'max_profit': 0,
+                            'max_loss': 0,
+                            'hold_days': 0,
+                            'highest_price': current_price,  # 记录最高价格（用于移动止损）
+                            'trailing_stop_price': 0         # 移动止损价格
+                        }
+                        
+                        # 更新资金
+                        self.current_capital -= current_price * quantity + buy_cost
+                        
+                        result.update({
+                            'action': 'buy',
+                            'signal_type': f"回撤{drop_percent:.1%} + {reversal_reason}",
+                            'quantity': quantity,
+                            'cost': buy_cost
+                        })
+                        
+                        logger.info(f"🟢 买入 {current_date} | 价格:{current_price:.2f} | 数量:{quantity:,}股 | 金额:{current_price*quantity:,.0f} | 成本:{buy_cost:.2f} | 信号:{result['signal_type']} | 剩余资金:{self.current_capital:,.0f}")
+        
+        # 如果有持仓，检查卖出信号
+        else:
+            # 更新持仓天数
+            self.current_position['hold_days'] = (current_date - self.current_position['entry_date']).days
             
-            # 检查是否在交易时间内
-            if not (self.market_open <= current_time.time() <= self.market_close):
-                continue
+            # 计算当前盈亏
+            sell_cost = self.calculate_trading_cost(current_price, self.current_position['quantity'], False)
+            current_pnl = (current_price - self.current_position['entry_price']) * self.current_position['quantity'] - self.current_position['buy_cost'] - sell_cost
+            current_pnl_percent = current_pnl / (self.current_position['entry_price'] * self.current_position['quantity']) * 100
             
-            # 强制平仓时间
-            if (current_time.time() >= self.force_close_time and position):
-                # 平仓
-                exit_price = current_price
-                sell_cost = self.calculate_trading_cost(exit_price, position['quantity'], False)
-                pnl = (exit_price - position['entry_price']) * position['quantity'] - position['buy_cost'] - sell_cost
-                pnl_percent = pnl / (position['entry_price'] * position['quantity']) * 100
+            # 更新最大盈亏和最高价格
+            self.current_position['max_profit'] = max(self.current_position['max_profit'], current_pnl)
+            self.current_position['max_loss'] = min(self.current_position['max_loss'], current_pnl)
+            
+            # 更新最高价格和移动止损价格
+            if current_price > self.current_position['highest_price']:
+                self.current_position['highest_price'] = current_price
+                if self.trailing_stop_enabled:
+                    self.current_position['trailing_stop_price'] = current_price * (1 - self.trailing_stop_percent)
+            
+            # 检查卖出条件
+            should_sell = False
+            exit_reason = ""
+            
+            # 最小持仓天数检查（避免过于频繁交易）
+            if self.current_position['hold_days'] < self.min_hold_days:
+                # 在最小持仓期内，只有严重止损才卖出
+                if current_pnl_percent <= -self.stop_loss_percent * 100 * 1.5:  # 严重止损阈值
+                    should_sell = True
+                    exit_reason = "严重止损"
+            else:
+                # 超过最小持仓期后，正常止盈止损逻辑
                 
-                trade = IntradayTrade(
-                    date=target_date,
+                # 止盈
+                if current_pnl_percent >= self.take_profit_percent * 100:
+                    should_sell = True
+                    exit_reason = "止盈"
+                
+                # 移动止损（优先级高于固定止损）
+                elif self.trailing_stop_enabled and self.current_position['trailing_stop_price'] > 0 and current_price <= self.current_position['trailing_stop_price']:
+                    should_sell = True
+                    exit_reason = "移动止损"
+                
+                # 固定止损
+                elif current_pnl_percent <= -self.stop_loss_percent * 100:
+                    should_sell = True
+                    exit_reason = "止损"
+                
+                # 时间止损（超过最大持仓天数）
+                elif self.current_position['hold_days'] >= self.max_hold_days:
+                    should_sell = True
+                    exit_reason = "时间止损"
+            
+            # 执行卖出
+            if should_sell:
+                trade = DailyTrade(
+                    entry_date=self.current_position['entry_date'],
+                    exit_date=current_date,
                     symbol=self.target_symbol,
-                    entry_time=position['entry_time'],
-                    exit_time=current_time.strftime('%H:%M'),
-                    entry_price=position['entry_price'],
-                    exit_price=exit_price,
-                    quantity=position['quantity'],
-                    pnl=pnl,
-                    pnl_percent=pnl_percent,
-                    exit_reason="收盘清仓",
-                    max_profit=position['max_profit'],
-                    max_loss=position['max_loss'],
-                    hold_minutes=position['hold_minutes']
+                    entry_price=self.current_position['entry_price'],
+                    exit_price=current_price,
+                    quantity=self.current_position['quantity'],
+                    pnl=current_pnl,
+                    pnl_percent=current_pnl_percent,
+                    exit_reason=exit_reason,
+                    max_profit=self.current_position['max_profit'],
+                    max_loss=self.current_position['max_loss'],
+                    hold_days=self.current_position['hold_days']
                 )
                 
-                daily_trades.append(trade)
-                # 更新资金（卖出 - 交易成本）
-                self.current_capital += exit_price * position['quantity'] - sell_cost
+                # 更新资金
+                self.current_capital += current_price * self.current_position['quantity'] - sell_cost
                 
-                # 打印详细卖出信息
-                logger.info(f"🔴 收盘清仓 {current_time.strftime('%H:%M')} | 价格:{exit_price:.2f} | 数量:{position['quantity']:,}股 | 金额:{exit_price*position['quantity']:,.0f} | 成本:{sell_cost:.2f} | 盈亏:{pnl:+.0f} ({pnl_percent:+.2f}%) | 总资金:{self.current_capital:,.0f}")
+                result.update({
+                    'action': 'sell',
+                    'trade': trade,
+                    'exit_reason': exit_reason
+                })
                 
-                position = None
-                break
-            
-            # 无持仓时寻找机会
-            if not position:
-                # 检查大跌信号
-                if looking_for_drop:
-                    is_drop, drop_magnitude = self.check_drop_signal(df, i)
-                    if is_drop:
-                        drop_detected = True
-                        looking_for_drop = False
-                        logger.info(f"{current_time.strftime('%H:%M')} 检测到大跌: {drop_magnitude:.2%}")
+                logger.info(f"🔴 卖出 {current_date} | 价格:{current_price:.2f} | 数量:{self.current_position['quantity']:,}股 | 金额:{current_price*self.current_position['quantity']:,.0f} | 成本:{sell_cost:.2f} | 盈亏:{current_pnl:+.0f} ({current_pnl_percent:+.2f}%) | 原因:{exit_reason} | 总资金:{self.current_capital:,.0f}")
                 
-                # 在大跌后寻找反弹机会
-                if drop_detected:
-                    is_reversal, reversal_reason = self.check_reversal_signal(df, i)
-                    if is_reversal:
-                        # 买入
-                        entry_price = current_price
-                        quantity = self.calculate_position_size(entry_price)
-                        
-                        if quantity > 0:
-                            # 计算买入成本
-                            buy_cost = self.calculate_trading_cost(entry_price, quantity, True)
-                            total_cost = entry_price * quantity + buy_cost
-                            
-                            if total_cost <= self.current_capital:
-                                position = {
-                                    'entry_time': current_time.strftime('%H:%M'),
-                                    'entry_datetime': current_time,  # 记录完整的买入时间
-                                    'entry_price': entry_price,
-                                    'quantity': quantity,
-                                    'buy_cost': buy_cost,
-                                    'max_profit': 0,
-                                    'max_loss': 0,
-                                    'hold_minutes': 0
-                                }
-                                
-                                # 更新资金（买入 + 交易成本）
-                                self.current_capital -= total_cost
-                                
-                                # 打印详细买入信息
-                                logger.info(f"🟢 买入信号 {current_time.strftime('%H:%M')} | 价格:{entry_price:.2f} | 数量:{quantity:,}股 | 金额:{entry_price*quantity:,.0f} | 成本:{buy_cost:.2f} | 原因:{reversal_reason} | 剩余资金:{self.current_capital:,.0f}")
-                                
-                                drop_detected = False  # 重置状态
-            
-            # 有持仓时检查出场信号
-            else:
-                # 计算实际持仓时间（分钟）
-                hold_time_delta = current_time - position['entry_datetime']
-                actual_hold_minutes = hold_time_delta.total_seconds() / 60
-                position['hold_minutes'] = int(actual_hold_minutes)
-                
-                # 检查最小持仓时间
-                if actual_hold_minutes < self.min_hold_minutes:
-                    continue  # 未达到最小持仓时间，跳过出场检查
-                
-                # 更新最大盈亏（考虑交易成本）
-                sell_cost = self.calculate_trading_cost(current_price, position['quantity'], False)
-                current_pnl = (current_price - position['entry_price']) * position['quantity'] - position['buy_cost'] - sell_cost
-                position['max_profit'] = max(position['max_profit'], current_pnl)
-                position['max_loss'] = min(position['max_loss'], current_pnl)
-                
-                # 检查止盈
-                profit_percent = (current_price / position['entry_price'] - 1)
-                if profit_percent >= self.take_profit_percent:
-                    exit_price = current_price
-                    sell_cost = self.calculate_trading_cost(exit_price, position['quantity'], False)
-                    pnl = (exit_price - position['entry_price']) * position['quantity'] - position['buy_cost'] - sell_cost
-                    pnl_percent = pnl / (position['entry_price'] * position['quantity']) * 100
-                    
-                    trade = IntradayTrade(
-                        date=target_date,
-                        symbol=self.target_symbol,
-                        entry_time=position['entry_time'],
-                        exit_time=current_time.strftime('%H:%M'),
-                        entry_price=position['entry_price'],
-                        exit_price=exit_price,
-                        quantity=position['quantity'],
-                        pnl=pnl,
-                        pnl_percent=pnl_percent,
-                        exit_reason="止盈",
-                        max_profit=position['max_profit'],
-                        max_loss=position['max_loss'],
-                        hold_minutes=position['hold_minutes']
-                    )
-                    
-                    daily_trades.append(trade)
-                    # 更新资金（卖出 - 交易成本）
-                    self.current_capital += exit_price * position['quantity'] - sell_cost
-                    
-                    # 打印详细卖出信息
-                    logger.info(f"🟢 止盈出场 {current_time.strftime('%H:%M')} | 价格:{exit_price:.2f} | 数量:{position['quantity']:,}股 | 金额:{exit_price*position['quantity']:,.0f} | 成本:{sell_cost:.2f} | 盈亏:{pnl:+.0f} ({pnl_percent:+.2f}%) | 总资金:{self.current_capital:,.0f}")
-                    
-                    position = None
-                    looking_for_drop = True  # 重新寻找机会
-                
-                # 检查止损
-                elif profit_percent <= -self.stop_loss_percent:
-                    exit_price = current_price
-                    sell_cost = self.calculate_trading_cost(exit_price, position['quantity'], False)
-                    pnl = (exit_price - position['entry_price']) * position['quantity'] - position['buy_cost'] - sell_cost
-                    pnl_percent = pnl / (position['entry_price'] * position['quantity']) * 100
-                    
-                    trade = IntradayTrade(
-                        date=target_date,
-                        symbol=self.target_symbol,
-                        entry_time=position['entry_time'],
-                        exit_time=current_time.strftime('%H:%M'),
-                        entry_price=position['entry_price'],
-                        exit_price=exit_price,
-                        quantity=position['quantity'],
-                        pnl=pnl,
-                        pnl_percent=pnl_percent,
-                        exit_reason="止损",
-                        max_profit=position['max_profit'],
-                        max_loss=position['max_loss'],
-                        hold_minutes=position['hold_minutes']
-                    )
-                    
-                    daily_trades.append(trade)
-                    # 更新资金（卖出 - 交易成本）
-                    self.current_capital += exit_price * position['quantity'] - sell_cost
-                    
-                    # 打印详细卖出信息
-                    logger.info(f"🔴 止损出场 {current_time.strftime('%H:%M')} | 价格:{exit_price:.2f} | 数量:{position['quantity']:,}股 | 金额:{exit_price*position['quantity']:,.0f} | 成本:{sell_cost:.2f} | 盈亏:{pnl:+.0f} ({pnl_percent:+.2f}%) | 总资金:{self.current_capital:,.0f}")
-                    
-                    position = None
-                    looking_for_drop = True  # 重新寻找机会
+                # 清空持仓
+                self.current_position = None
         
-        # 统计当日结果
-        daily_pnl = sum(trade.pnl for trade in daily_trades)
-        
-        # 保存交易记录
-        self.trades.extend(daily_trades)
-        
-        return {
-            'date': target_date,
-            'trades': len(daily_trades),
-            'pnl': daily_pnl,
-            'capital': self.current_capital,
-            'details': daily_trades
-        }
+        return result
     
     def run_backtest(self, start_date: date = None, end_date: date = None) -> Dict:
-        """运行回测"""
-        # 使用默认时间范围
+        """运行日级别回测"""
         if start_date is None:
             start_date = self.default_start_date
         if end_date is None:
             end_date = self.default_end_date
-            
-        logger.info(f"开始回测: {start_date} 到 {end_date}, 初始资金: {self.initial_capital:,.0f}港币")
         
-        # 重置状态
+        logger.info(f"开始日级别暴跌反弹策略回测: {self.target_symbol} ({start_date} 到 {end_date})")
+        logger.info(f"初始资金: {self.current_capital:,.0f} 港币")
+        
+        # 获取整个回测期间的日线数据
+        df = self.get_daily_data(self.target_symbol, start_date, end_date)
+        if df.empty:
+            logger.error("无法获取历史数据")
+            return {}
+        
+        # 重置交易状态
         self.trades = []
-        self.daily_stats = []
+        self.current_position = None
         self.current_capital = self.initial_capital
         
-        # 获取交易日列表
-        trading_days = self.get_trading_days(start_date, end_date)
+        # 遍历每个交易日
+        for i in range(len(df)):
+            current_date = df.index[i]
+            
+            # 处理当日交易逻辑
+            day_result = self.process_trading_day(df, i)
+            
+            # 如果有交易，记录到trades列表
+            if day_result['action'] == 'sell' and day_result['trade']:
+                self.trades.append(day_result['trade'])
         
-        total_pnl = 0
-        trading_days_count = 0
+        # 如果回测结束时还有持仓，强制平仓
+        if self.current_position:
+            final_date = df.index[-1]
+            final_price = df.iloc[-1]['close']
+            sell_cost = self.calculate_trading_cost(final_price, self.current_position['quantity'], False)
+            final_pnl = (final_price - self.current_position['entry_price']) * self.current_position['quantity'] - self.current_position['buy_cost'] - sell_cost
+            final_pnl_percent = final_pnl / (self.current_position['entry_price'] * self.current_position['quantity']) * 100
+            
+            final_trade = DailyTrade(
+                entry_date=self.current_position['entry_date'],
+                exit_date=final_date,
+                symbol=self.target_symbol,
+                entry_price=self.current_position['entry_price'],
+                exit_price=final_price,
+                quantity=self.current_position['quantity'],
+                pnl=final_pnl,
+                pnl_percent=final_pnl_percent,
+                exit_reason="回测结束",
+                max_profit=self.current_position['max_profit'],
+                max_loss=self.current_position['max_loss'],
+                hold_days=(final_date - self.current_position['entry_date']).days
+            )
+            
+            self.trades.append(final_trade)
+            self.current_capital += final_price * self.current_position['quantity'] - sell_cost
+            self.current_position = None
         
-        for trading_day in trading_days:
-            try:
-                daily_result = self.simulate_trading_day(trading_day)
-                self.daily_stats.append(daily_result)
-                
-                total_pnl += daily_result['pnl']
-                trading_days_count += 1
-                
-                # 优化日志显示：一天的交易显示在一行
-                if daily_result['trades'] > 0:
-                    trades_info = []
-                    for trade in daily_result['details']:
-                        trades_info.append(f"{trade.entry_time}-{trade.exit_time}({trade.exit_reason}:{trade.pnl:+.0f})")
-                    logger.info(f"{trading_day}: {daily_result['trades']}笔 [{', '.join(trades_info)}] 日盈亏:{daily_result['pnl']:+.0f} 总资金:{daily_result['capital']:,.0f}")
-                
-            except Exception as e:
-                logger.error(f"{trading_day} 交易模拟失败: {e}")
-                continue
+        # 计算总体结果
+        total_pnl = self.current_capital - self.initial_capital
+        trading_days = len(df)
         
         # 生成回测报告
-        final_capital = self.current_capital
-        results = self.generate_backtest_report(total_pnl, trading_days_count)
+        results = self.generate_backtest_report(total_pnl, trading_days)
         results['initial_capital'] = self.initial_capital
-        results['final_capital'] = final_capital
+        results['final_capital'] = self.current_capital
         
         return results
     
-    def get_trading_days(self, start_date: date, end_date: date) -> List[date]:
-        """获取交易日列表（简化版，实际应该排除节假日）"""
-        trading_days = []
-        current_date = start_date
-        
-        while current_date <= end_date:
-            # 排除周末
-            if current_date.weekday() < 5:  # 0-4 是周一到周五
-                trading_days.append(current_date)
-            current_date += timedelta(days=1)
-        
-        return trading_days
+
     
     def generate_backtest_report(self, total_pnl: float, trading_days: int) -> Dict:
         """生成详细回测报告"""
@@ -558,7 +541,17 @@ class IntradayReversalStrategy:
                 'total_return_percent': 0,
                 'sharpe_ratio': 0,
                 'max_drawdown': 0,
-                'profit_loss_ratio': 0
+                'profit_loss_ratio': 0,
+                'winning_trades': 0,
+                'losing_trades': 0,
+                'avg_win': 0,
+                'avg_loss': 0,
+                'avg_hold_days': 0,
+                'exit_reasons': {},
+                'trading_days': trading_days,
+                'max_consecutive_wins': 0,
+                'max_consecutive_losses': 0,
+                'trading_day_ratio': 0
             }
         
         # 基本统计
@@ -620,7 +613,7 @@ class IntradayReversalStrategy:
             sharpe_ratio = 0
         
         # 计算交易日比例
-        trading_day_ratio = len(set(t.date for t in self.trades)) / trading_days * 100 if trading_days > 0 else 0
+        trading_day_ratio = len(set(t.entry_date for t in self.trades)) / trading_days * 100 if trading_days > 0 else 0
         
         # 按退出原因统计
         exit_reasons = {}
@@ -632,7 +625,7 @@ class IntradayReversalStrategy:
             exit_reasons[reason]['pnl'] += trade.pnl
         
         # 平均持仓时间
-        avg_hold_minutes = np.mean([t.hold_minutes for t in self.trades]) if self.trades else 0
+        avg_hold_days = np.mean([t.hold_days for t in self.trades]) if self.trades else 0
         
         return {
             'total_trades': total_trades,
@@ -643,7 +636,7 @@ class IntradayReversalStrategy:
             'max_loss': max_loss,
             'winning_trades': len(winning_trades),
             'losing_trades': len(losing_trades),
-            'avg_hold_minutes': avg_hold_minutes,
+            'avg_hold_days': avg_hold_days,
             'exit_reasons': exit_reasons,
             'trading_days': trading_days,
             'total_return_percent': total_return_percent,
@@ -660,68 +653,70 @@ class IntradayReversalStrategy:
     def print_detailed_report(self, results: Dict):
         """打印详细报告"""
         print("\n" + "="*80)
-        print("           日内反弹策略回测报告")
+        print("           日级别反弹策略回测报告")
         print("="*80)
         
         print(f"\n💰 资金统计:")
-        print(f"   初始资金: {results['initial_capital']:,.0f} 港币")
-        print(f"   最终资金: {results['final_capital']:,.0f} 港币")
-        print(f"   总盈亏: {results['total_pnl']:+,.0f} 港币")
-        print(f"   总收益率: {results['total_return_percent']:+.2f}%")
+        print(f"   初始资金: {results.get('initial_capital', 0):,.0f} 港币")
+        print(f"   最终资金: {results.get('final_capital', 0):,.0f} 港币")
+        print(f"   总盈亏: {results.get('total_pnl', 0):+,.0f} 港币")
+        print(f"   总收益率: {results.get('total_return_percent', 0):+.2f}%")
         
         print(f"\n📊 基本统计:")
-        print(f"   总交易次数: {results['total_trades']}")
-        print(f"   胜率: {results['win_rate']:.1f}% ({results['winning_trades']}/{results['total_trades']})")
-        print(f"   平均每笔盈亏: {results['avg_pnl_per_trade']:+,.0f} 港币")
-        print(f"   平均盈利: {results['avg_win']:+,.0f} 港币")
-        print(f"   平均亏损: {results['avg_loss']:+,.0f} 港币")
-        print(f"   盈亏比: {results['profit_loss_ratio']:.2f}")
-        print(f"   平均持仓时间: {results['avg_hold_minutes']:.1f} 分钟")
+        print(f"   总交易次数: {results.get('total_trades', 0)}")
+        print(f"   胜率: {results.get('win_rate', 0):.1f}% ({results.get('winning_trades', 0)}/{results.get('total_trades', 0)})")
+        print(f"   平均每笔盈亏: {results.get('avg_pnl_per_trade', 0):+,.0f} 港币")
+        print(f"   平均盈利: {results.get('avg_win', 0):+,.0f} 港币")
+        print(f"   平均亏损: {results.get('avg_loss', 0):+,.0f} 港币")
+        print(f"   盈亏比: {results.get('profit_loss_ratio', 0):.2f}")
+        print(f"   平均持仓时间: {results.get('avg_hold_days', 0):.1f} 天")
         
         print(f"\n📈 风险指标:")
-        print(f"   最大回撤: {results['max_drawdown']:.2f}%")
-        print(f"   夏普比率: {results['sharpe_ratio']:.2f}")
-        print(f"   最大单笔盈利: {results['max_profit']:+,.0f} 港币")
-        print(f"   最大单笔亏损: {results['max_loss']:+,.0f} 港币")
-        print(f"   最大连续盈利: {results['max_consecutive_wins']} 笔")
-        print(f"   最大连续亏损: {results['max_consecutive_losses']} 笔")
+        print(f"   最大回撤: {results.get('max_drawdown', 0):.2f}%")
+        print(f"   夏普比率: {results.get('sharpe_ratio', 0):.2f}")
+        print(f"   最大单笔盈利: {results.get('max_profit', 0):+,.0f} 港币")
+        print(f"   最大单笔亏损: {results.get('max_loss', 0):+,.0f} 港币")
+        print(f"   最大连续盈利: {results.get('max_consecutive_wins', 0)} 笔")
+        print(f"   最大连续亏损: {results.get('max_consecutive_losses', 0)} 笔")
         
         print(f"\n📅 交易统计:")
-        print(f"   交易天数: {results['trading_days']} 天")
-        print(f"   交易日比例: {results['trading_day_ratio']:.1f}%")
+        print(f"   交易天数: {results.get('trading_days', 0)} 天")
+        print(f"   交易日比例: {results.get('trading_day_ratio', 0):.1f}%")
         
         print(f"\n🚪 退出原因统计:")
-        for reason, stats in results['exit_reasons'].items():
-            avg_pnl = stats['pnl'] / stats['count'] if stats['count'] > 0 else 0
-            print(f"   {reason}: {stats['count']} 笔, 总盈亏: {stats['pnl']:+,.0f}, 平均: {avg_pnl:+,.0f}")
+        for reason, stats in results.get('exit_reasons', {}).items():
+            if isinstance(stats, dict):
+                avg_pnl = stats['pnl'] / stats['count'] if stats['count'] > 0 else 0
+                print(f"   {reason}: {stats['count']} 笔, 总盈亏: {stats['pnl']:+,.0f}, 平均: {avg_pnl:+,.0f}")
+            else:
+                print(f"   {reason}: {stats} 笔")
         
         if self.trades:
             print(f"\n📋 最近5笔交易:")
             for trade in self.trades[-5:]:
-                print(f"   {trade.date} {trade.entry_time}-{trade.exit_time}: "
+                print(f"   {trade.entry_date} -> {trade.exit_date}: "
                       f"{trade.pnl:+.0f} ({trade.pnl_percent:+.2f}%) - {trade.exit_reason}")
         
         print("\n" + "="*80)
 
 def main():
     """主函数"""
-    strategy = IntradayReversalStrategy()
+    strategy = DailyReversalStrategy()
     
-    # 设置回测期间
-    start_date = date(2024, 1, 1)
-    end_date = date(2025, 3, 31)  # 3个月回测
-    
-    print(f"🚀 开始日内反弹策略回测")
-    print(f"📅 回测期间: {start_date} 至 {end_date}")
+    print(f"🚀 开始日级别暴跌反弹策略回测（支持持仓过周）")
+    print(f"📅 回测期间: {strategy.backtest_start_date} 至 {strategy.backtest_end_date}")
     print(f"🎯 目标股票: {strategy.target_symbol} (阿里巴巴)")
     print(f"💰 初始资金: {strategy.initial_capital:,} 港币 (全仓操作)")
-    print(f"📉 大跌阈值: {strategy.min_drop_percent:.1%}")
-    print(f"📈 反弹确认: {strategy.reversal_confirm_percent:.1%}")
-    print(f"🛑 止损: {strategy.stop_loss_percent:.1%}")
-    print(f"🎯 止盈: {strategy.take_profit_percent:.1%}")
+    print(f"📊 策略参数（最优配置）:")
+    print(f"   回撤阈值: {strategy.min_drop_percent:.1%} (严重回撤: {strategy.severe_drop_percent:.1%})")
+    print(f"   止损/止盈: {strategy.stop_loss_percent:.1%} / {strategy.take_profit_percent:.1%}")
+    print(f"   成交量确认: {strategy.min_volume_surge}倍 / 严重回撤{strategy.severe_volume_surge}倍")
+    print(f"   持仓天数: {strategy.min_hold_days}-{strategy.max_hold_days}天")
+    print(f"   移动止损: {'启用' if strategy.trailing_stop_enabled else '禁用'} ({strategy.trailing_stop_percent:.1%})")
+    print(f"   周末持仓: {'支持' if strategy.weekend_hold_enabled else '不支持'}")
     
-    # 运行回测
-    results = strategy.run_backtest(start_date, end_date)
+    # 运行回测（使用策略对象中配置的日期）
+    results = strategy.run_backtest(strategy.backtest_start_date, strategy.backtest_end_date)
     
     # 打印报告
     strategy.print_detailed_report(results)
@@ -730,22 +725,21 @@ def main():
     if strategy.trades:
         trades_df = pd.DataFrame([
             {
-                'date': t.date,
-                'entry_time': t.entry_time,
-                'exit_time': t.exit_time,
+                'entry_date': t.entry_date,
+                'exit_date': t.exit_date,
                 'entry_price': t.entry_price,
                 'exit_price': t.exit_price,
                 'quantity': t.quantity,
                 'pnl': t.pnl,
                 'pnl_percent': t.pnl_percent,
                 'exit_reason': t.exit_reason,
-                'hold_minutes': t.hold_minutes
+                'hold_days': t.hold_days
             }
             for t in strategy.trades
         ])
         
-        trades_df.to_csv('intraday_reversal_trades.csv', index=False)
-        print(f"\n💾 交易记录已保存到 intraday_reversal_trades.csv")
+        trades_df.to_csv('daily_reversal_trades.csv', index=False)
+        print(f"\n💾 交易记录已保存到 daily_reversal_trades.csv")
 
 if __name__ == "__main__":
     main()
