@@ -489,29 +489,32 @@ class RBreakerStrategy:
             if trade.pnl > 0:
                 trade_types[reason]['wins'] += 1
         
-        # 多空统计分析
-        long_trades = 0  # 做多交易次数
-        short_trades = 0  # 做空交易次数
+        # 多空统计分析 - 只计算开仓操作
+        long_trades = 0  # 开多仓次数
+        short_trades = 0  # 开空仓次数
         long_pnl = 0  # 做多总盈亏
         short_pnl = 0  # 做空总盈亏
         long_wins = 0  # 做多盈利次数
         short_wins = 0  # 做空盈利次数
         
         for trade in self.trades:
-            if trade.action == "BUY":
+            # 开多仓的情况：突破买入
+            if trade.action == "BUY" and "突破买入" in trade.reason:
                 long_trades += 1
                 long_pnl += trade.pnl
                 if trade.pnl > 0:
                     long_wins += 1
-            elif trade.action == "SELL":
+            # 开空仓的情况：突破卖出
+            elif trade.action == "SELL" and "突破卖出" in trade.reason:
                 short_trades += 1
                 short_pnl += trade.pnl
                 if trade.pnl > 0:
                     short_wins += 1
         
-        # 计算多空比例和胜率
-        long_ratio = (long_trades / total_trades * 100) if total_trades > 0 else 0
-        short_ratio = (short_trades / total_trades * 100) if total_trades > 0 else 0
+        # 计算多空比例和胜率（基于开仓次数）
+        total_open_trades = long_trades + short_trades
+        long_ratio = (long_trades / total_open_trades * 100) if total_open_trades > 0 else 0
+        short_ratio = (short_trades / total_open_trades * 100) if total_open_trades > 0 else 0
         long_win_rate = (long_wins / long_trades * 100) if long_trades > 0 else 0
         short_win_rate = (short_wins / short_trades * 100) if short_trades > 0 else 0
         
@@ -636,10 +639,10 @@ class RBreakerStrategy:
             },
             "交易类型分析": trade_types,
             "多空统计": {
-                "做多交易次数": long_trades,
-                "做空交易次数": short_trades,
-                "做多比例": f"{long_ratio:.2f}%",
-                "做空比例": f"{short_ratio:.2f}%",
+                "开多仓次数": long_trades,
+                "开空仓次数": short_trades,
+                "开多仓比例": f"{long_ratio:.2f}%",
+                "开空仓比例": f"{short_ratio:.2f}%",
                 "做多总盈亏": f"{long_pnl:.2f}",
                 "做空总盈亏": f"{short_pnl:.2f}",
                 "做多胜率": f"{long_win_rate:.2f}%",
