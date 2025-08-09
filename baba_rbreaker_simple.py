@@ -36,33 +36,70 @@ class Trade:
     pnl: float = 0.0
     pnl_percent: float = 0.0
     hold_minutes: int = 0
+    commission: float = 0.0  # 交易费用
+
+@dataclass
+class StrategyConfig:
+    """策略配置参数"""
+    # 交易标的设置
+    symbol: str = "QQQ.US"  # 交易标的代码
+    
+    # R-Breaker策略参数
+    f1: float = 0.5   # 突破买入系数（提高阈值减少假突破）
+    f2: float = 0.15  # 观察卖出系数
+    f3: float = 0.4   # 反转卖出系数（提高阈值减少频繁交易）
+    f4: float = 0.15  # 观察买入系数
+    f5: float = 0.3   # 反转买入系数（适度提高）
+    
+    # 交易控制参数
+    initial_capital: float = 100000  # 初始资金10万美元
+    stop_loss_percent: float = 0.02   # 止损2%（放宽一点减少止损频率）
+    max_hold_minutes: int = 300       # 最大持仓时间5小时（延长持仓）
+    min_price_move: float = 0.25      # 最小价格变动阈值（提高过滤噪音）
+    cooldown_minutes: int = 30        # 交易冷却时间30分钟（大幅延长）
+    
+    # 费率设置
+    commission_per_share: float = 0.01  # 每股交易费用0.01美元
+    
+    # 回测设置
+    backtest_days: int = 600  # 回测天数
+    
+    # 连接设置
+    max_retries: int = 3  # API连接最大重试次数
+    retry_delay: float = 2.0  # 重试间隔秒数
+    
+    def print_config(self):
+        """打印配置参数"""
+        print(f"交易标的: {self.symbol}")
+        print(f"初始资金: ${self.initial_capital:,.2f}")
+        print(f"R-Breaker参数: f1={self.f1}, f2={self.f2}, f3={self.f3}, f4={self.f4}, f5={self.f5}")
+        print(f"止损比例: {self.stop_loss_percent*100:.1f}%")
+        print(f"最大持仓时间: {self.max_hold_minutes}分钟")
+        print(f"最小价格变动: ${self.min_price_move}")
+        print(f"交易冷却时间: {self.cooldown_minutes}分钟")
+        print(f"每股手续费: ${self.commission_per_share}")
+        print(f"回测天数: {self.backtest_days}天")
+        print(f"最大重试次数: {self.max_retries}次")
+        print(f"重试间隔: {self.retry_delay}秒")
 
 class RBreakerStrategy:
     """R-Breaker日内交易策略"""
     
-    def __init__(self):
+    def __init__(self, config: StrategyConfig = None):
         """初始化策略"""
-        self.config = Config.from_env()
-        self.quote_ctx = QuoteContext(self.config)
+        self.longport_config = Config.from_env()
+        self.quote_ctx = QuoteContext(self.longport_config)
         
-        # R-Breaker策略参数（优化后的参数）
-        self.f1 = 0.35  # 突破买入系数（提高阈值减少假突破）
-        self.f2 = 0.15  # 观察卖出系数（提高阈值）
-        self.f3 = 0.25  # 反转卖出系数（适中阈值）
-        self.f4 = 0.15  # 观察买入系数（提高阈值）
-        self.f5 = 0.25  # 反转买入系数（适中阈值）
+        # 策略配置
+        self.config = config if config else StrategyConfig()
         
-        # 交易参数
-        self.max_position_size = 1000  # 最大持仓数量
-        self.stop_loss_percent = 0.015  # 止损1.5%（更严格）
-        self.max_hold_minutes = 180    # 最大持仓时间3小时（更短）
-        self.min_price_move = 0.10     # 最小价格变动阈值
-        self.cooldown_minutes = 5      # 交易冷却时间5分钟
-        self.initial_capital = 100000  # 初始资金10万美元
+        # 资金管理
+        self.current_capital = self.config.initial_capital  # 当前可用资金
+        self.total_commission = 0.0  # 总交易费用
         
         # 回测数据
         self.trades: List[Trade] = []
-        self.position = 0  # 当前持仓
+        self.position = 0  # 当前持仓数量（正数为多头，负数为空头）
         self.position_price = 0.0  # 持仓成本
         self.position_time = None  # 开仓时间
         self.last_trade_time = None  # 上次交易时间
@@ -94,37 +131,50 @@ class RBreakerStrategy:
             batch_end_date = min(current_date + timedelta(days=batch_days-1), end_date)
             logger.info(f"获取批次数据: {current_date} 到 {batch_end_date}")
             
-            try:
-                # 获取分钟级数据
-                candles = self.quote_ctx.history_candlesticks_by_date(
-                    symbol,
-                    Period.Min_1,  # 1分钟K线
-                    AdjustType.ForwardAdjust,
-                    current_date,
-                    batch_end_date
-                )
-                
-                if candles:
-                    logger.info(f"批次 {current_date}-{batch_end_date}: 获取到 {len(candles)} 条数据")
+            # 重试机制
+            success = False
+            for retry in range(self.config.max_retries):
+                try:
+                    # 获取分钟级数据
+                    candles = self.quote_ctx.history_candlesticks_by_date(
+                        symbol,
+                        Period.Min_1,  # 1分钟K线
+                        AdjustType.ForwardAdjust,
+                        current_date,
+                        batch_end_date
+                    )
                     
-                    for candle in candles:
-                        all_data.append({
-                            'datetime': candle.timestamp,
-                            'open': float(candle.open),
-                            'high': float(candle.high),
-                            'low': float(candle.low),
-                            'close': float(candle.close),
-                            'volume': int(candle.volume),
-                            'turnover': float(candle.turnover)
-                        })
-                else:
-                    logger.warning(f"批次 {current_date}-{batch_end_date}: API返回空数据")
-                
+                    if candles:
+                        logger.info(f"批次 {current_date}-{batch_end_date}: 获取到 {len(candles)} 条数据")
+                        
+                        for candle in candles:
+                            all_data.append({
+                                'datetime': candle.timestamp,
+                                'open': float(candle.open),
+                                'high': float(candle.high),
+                                'low': float(candle.low),
+                                'close': float(candle.close),
+                                'volume': int(candle.volume),
+                                'turnover': float(candle.turnover)
+                            })
+                        success = True
+                        break
+                    else:
+                        logger.warning(f"批次 {current_date}-{batch_end_date}: API返回空数据")
+                        success = True
+                        break
+                    
+                except Exception as e:
+                    logger.error(f"获取批次数据失败 {current_date}-{batch_end_date} (重试 {retry+1}/{self.config.max_retries}): {e}")
+                    if retry < self.config.max_retries - 1:
+                        logger.info(f"等待 {self.config.retry_delay} 秒后重试...")
+                        time.sleep(self.config.retry_delay)
+                    else:
+                        logger.error(f"批次 {current_date}-{batch_end_date}: 重试次数已用完，跳过此批次")
+            
+            if success:
                 # 添加延迟避免API限制
                 time.sleep(0.5)
-                
-            except Exception as e:
-                logger.error(f"获取批次数据失败 {current_date}-{batch_end_date}: {e}")
             
             current_date = batch_end_date + timedelta(days=1)
         
@@ -170,12 +220,12 @@ class RBreakerStrategy:
         
         # 计算六个关键价位
         levels = {
-            'bbreak': prev_high + self.f1 * (prev_close - prev_low),      # 突破买入价
-            'ssetup': pivot + self.f2 * (prev_high - prev_low),           # 观察卖出价
-            'senter': (1 + self.f3) * pivot - self.f3 * prev_low,        # 反转卖出价
-            'benter': (1 + self.f5) * pivot - self.f5 * prev_high,       # 反转买入价
-            'bsetup': pivot - self.f4 * (prev_high - prev_low),           # 观察买入价
-            'sbreak': prev_low - self.f1 * (prev_high - prev_close)       # 突破卖出价
+            'bbreak': prev_high + self.config.f1 * (prev_close - prev_low),      # 突破买入价
+            'ssetup': pivot + self.config.f2 * (prev_high - prev_low),           # 观察卖出价
+            'senter': (1 + self.config.f3) * pivot - self.config.f3 * prev_low,        # 反转卖出价
+            'benter': (1 + self.config.f5) * pivot - self.config.f5 * prev_high,       # 反转买入价
+            'bsetup': pivot - self.config.f4 * (prev_high - prev_low),           # 观察买入价
+            'sbreak': prev_low - self.config.f1 * (prev_high - prev_close)       # 突破卖出价
         }
         
         return levels
@@ -206,27 +256,27 @@ class RBreakerStrategy:
         # 检查交易冷却时间
         if self.last_trade_time:
             minutes_since_last_trade = (current_time - self.last_trade_time).total_seconds() / 60
-            if minutes_since_last_trade < self.cooldown_minutes:
+            if minutes_since_last_trade < self.config.cooldown_minutes:
                 return "HOLD", "冷却时间"
         
         # 如果有持仓，检查平仓信号
         if self.position != 0:
             # 检查止损
             if self.position > 0:  # 多头持仓
-                if current_price <= self.position_price * (1 - self.stop_loss_percent):
+                if current_price <= self.position_price * (1 - self.config.stop_loss_percent):
                     return "SELL", "止损"
                 # 检查反转卖出
-                if current_price >= levels['senter'] and abs(current_price - levels['senter']) >= self.min_price_move:
+                if current_price >= levels['senter'] and abs(current_price - levels['senter']) >= self.config.min_price_move:
                     return "SELL", "反转卖出"
             else:  # 空头持仓
-                if current_price >= self.position_price * (1 + self.stop_loss_percent):
+                if current_price >= self.position_price * (1 + self.config.stop_loss_percent):
                     return "BUY", "止损"
                 # 检查反转买入
-                if current_price <= levels['benter'] and abs(levels['benter'] - current_price) >= self.min_price_move:
+                if current_price <= levels['benter'] and abs(levels['benter'] - current_price) >= self.config.min_price_move:
                     return "BUY", "反转买入"
             
             # 检查最大持仓时间
-            if self.position_time and (current_time - self.position_time).total_seconds() / 60 >= self.max_hold_minutes:
+            if self.position_time and (current_time - self.position_time).total_seconds() / 60 >= self.config.max_hold_minutes:
                 if self.position > 0:
                     return "SELL", "超时平仓"
                 else:
@@ -235,63 +285,98 @@ class RBreakerStrategy:
         # 如果没有持仓，检查开仓信号
         else:
             # 突破买入
-            if current_price > levels['bbreak'] and abs(current_price - levels['bbreak']) >= self.min_price_move:
+            if current_price > levels['bbreak'] and abs(current_price - levels['bbreak']) >= self.config.min_price_move:
                 return "BUY", "突破买入"
             # 突破卖出
-            elif current_price < levels['sbreak'] and abs(levels['sbreak'] - current_price) >= self.min_price_move:
+            elif current_price < levels['sbreak'] and abs(levels['sbreak'] - current_price) >= self.config.min_price_move:
                 return "SELL", "突破卖出"
         
         return signal, reason
     
     def execute_trade(self, signal: str, price: float, current_time: datetime, reason: str):
-        """执行交易"""
+        """执行交易（全仓交易）"""
         if signal == "HOLD":
             return
         
         quantity = 0
         amount = 0
-        pnl = 0
-        pnl_percent = 0
-        hold_minutes = 0
+        pnl = 0.0  # 开仓时pnl为0
+        pnl_percent = 0.0  # 开仓时pnl_percent为0
+        hold_minutes = 0  # 开仓时hold_minutes为0
+        commission = 0
         
         if signal == "BUY":
             if self.position <= 0:  # 开多仓或平空仓
                 if self.position < 0:  # 平空仓
                     quantity = abs(self.position)
                     amount = quantity * price
-                    pnl = (self.position_price - price) * quantity
+                    commission = quantity * self.config.commission_per_share
+                    pnl = (self.position_price - price) * quantity - commission
                     pnl_percent = pnl / (self.position_price * quantity) * 100
                     if self.position_time:
                         hold_minutes = int((current_time - self.position_time).total_seconds() / 60)
+                    
+                    # 更新资金：平空仓后资金 = 当前资金 + 原保证金 + 盈亏
+                    original_margin = self.position_price * quantity
+                    self.current_capital += original_margin + pnl
                     self.position = 0
-                else:  # 开多仓
-                    quantity = self.max_position_size
-                    amount = quantity * price
-                    self.position = quantity
-                    self.position_price = price
-                    self.position_time = current_time
+                    self.position_price = 0.0
+                    self.position_time = None
+                else:  # 开多仓（全仓）
+                    # 计算能买入的最大股数（考虑手续费）
+                    max_quantity = int(self.current_capital / (price + self.config.commission_per_share))
+                    if max_quantity > 0:
+                        quantity = max_quantity
+                        amount = quantity * price
+                        commission = quantity * self.config.commission_per_share
+                        total_cost = amount + commission
+                        
+                        self.current_capital -= total_cost
+                        self.position = quantity
+                        self.position_price = price
+                        self.position_time = current_time
+                    else:
+                        return  # 资金不足，不执行交易
         
         elif signal == "SELL":
             if self.position >= 0:  # 平多仓或开空仓
                 if self.position > 0:  # 平多仓
                     quantity = self.position
                     amount = quantity * price
-                    pnl = (price - self.position_price) * quantity
+                    commission = quantity * self.config.commission_per_share
+                    pnl = (price - self.position_price) * quantity - commission
                     pnl_percent = pnl / (self.position_price * quantity) * 100
                     if self.position_time:
                         hold_minutes = int((current_time - self.position_time).total_seconds() / 60)
+                    
+                    # 更新资金：平多仓后资金 = 当前资金 + 卖出金额 - 手续费
+                    self.current_capital += amount - commission
                     self.position = 0
-                else:  # 开空仓
-                    quantity = self.max_position_size
-                    amount = quantity * price
-                    self.position = -quantity
-                    self.position_price = price
-                    self.position_time = current_time
+                    self.position_price = 0.0
+                    self.position_time = None
+                else:  # 开空仓（全仓）
+                    max_quantity = int(self.current_capital / (price + self.config.commission_per_share))
+                    if max_quantity > 0:
+                        quantity = max_quantity
+                        amount = quantity * price
+                        commission = quantity * self.config.commission_per_share
+                        total_margin = amount + commission
+                        
+                        # 做空：冻结保证金和手续费
+                        self.current_capital -= total_margin
+                        self.position = -quantity
+                        self.position_price = price
+                        self.position_time = current_time
+                    else:
+                        return  # 资金不足，不执行交易
+        
+        # 更新总手续费
+        self.total_commission += commission
         
         # 记录交易
         trade = Trade(
             datetime=current_time,
-            symbol="BABA.US",
+            symbol=self.config.symbol,
             action=signal,
             price=price,
             quantity=quantity,
@@ -299,12 +384,13 @@ class RBreakerStrategy:
             reason=reason,
             pnl=pnl,
             pnl_percent=pnl_percent,
-            hold_minutes=hold_minutes
+            hold_minutes=hold_minutes,
+            commission=commission
         )
         
         self.trades.append(trade)
         self.last_trade_time = current_time  # 更新最后交易时间
-        logger.info(f"{current_time}: {signal} {quantity}股 @{price:.2f} - {reason} (PnL: {pnl:.2f})")
+        logger.info(f"{current_time}: {signal} {quantity}股 @{price:.2f} - {reason} (PnL: {pnl:.2f}, 手续费: {commission:.2f}, 可用资金: {self.current_capital:.2f})")
     
     def run_backtest(self, symbol: str, start_date: date, end_date: date) -> Dict:
         """运行回测"""
@@ -316,23 +402,14 @@ class RBreakerStrategy:
             logger.error("无法获取数据，回测终止")
             return {}
         
-        # 打印数据的日期范围
-        logger.info(f"分钟数据日期范围: {minute_data.index.min()} 到 {minute_data.index.max()}")
-        logger.info(f"分钟数据包含的日期: {sorted(set(minute_data.index.date))}")
-        
         # 获取日线数据用于计算R-Breaker水平
         daily_data = self.get_daily_ohlc(minute_data)
-        
-        logger.info(f"数据准备完成: {len(minute_data)} 条分钟数据, {len(daily_data)} 个交易日")
         
         # 重置状态
         self.trades = []
         self.position = 0
         self.position_price = 0.0
         self.position_time = None
-        
-        # 打印所有可用的交易日期
-        logger.info(f"可用的交易日期: {list(daily_data.index)}")
         
         # 按日期进行回测
         for current_date in daily_data.index[1:]:  # 从第二天开始，因为需要前一天的数据
@@ -346,21 +423,13 @@ class RBreakerStrategy:
             # 计算R-Breaker水平
             levels = self.calculate_rbreaker_levels(prev_high, prev_low, prev_close)
             
-            logger.info(f"\n{current_date} R-Breaker水平:")
-            for level_name, level_value in levels.items():
-                logger.info(f"  {level_name}: {level_value:.2f}")
-            
             # 获取当日分钟数据
             day_minute_data = minute_data[minute_data.index.date == current_date]
             
             if day_minute_data.empty:
-                logger.info(f"{current_date}: 没有分钟数据")
                 continue
             
-            logger.info(f"{current_date}: 有 {len(day_minute_data)} 条分钟数据")
-            
             # 遍历当日每分钟数据
-            signal_count = 0
             for current_time, row in day_minute_data.iterrows():
                 current_price = row['close']
                 
@@ -370,9 +439,6 @@ class RBreakerStrategy:
                 # 执行交易
                 if signal != "HOLD":
                     self.execute_trade(signal, current_price, current_time, reason)
-                    signal_count += 1
-            
-            print(f"{current_date}: 当日产生 {signal_count} 个交易信号")
         
         # 如果最后还有持仓，强制平仓
         if self.position != 0:
@@ -423,6 +489,36 @@ class RBreakerStrategy:
             if trade.pnl > 0:
                 trade_types[reason]['wins'] += 1
         
+        # 多空统计分析
+        long_trades = 0  # 做多交易次数
+        short_trades = 0  # 做空交易次数
+        long_pnl = 0  # 做多总盈亏
+        short_pnl = 0  # 做空总盈亏
+        long_wins = 0  # 做多盈利次数
+        short_wins = 0  # 做空盈利次数
+        
+        for trade in self.trades:
+            if trade.action == "BUY":
+                long_trades += 1
+                long_pnl += trade.pnl
+                if trade.pnl > 0:
+                    long_wins += 1
+            elif trade.action == "SELL":
+                short_trades += 1
+                short_pnl += trade.pnl
+                if trade.pnl > 0:
+                    short_wins += 1
+        
+        # 计算多空比例和胜率
+        long_ratio = (long_trades / total_trades * 100) if total_trades > 0 else 0
+        short_ratio = (short_trades / total_trades * 100) if total_trades > 0 else 0
+        long_win_rate = (long_wins / long_trades * 100) if long_trades > 0 else 0
+        short_win_rate = (short_wins / short_trades * 100) if short_trades > 0 else 0
+        
+        # 计算平均盈亏
+        avg_long_pnl = long_pnl / long_trades if long_trades > 0 else 0
+        avg_short_pnl = short_pnl / short_trades if short_trades > 0 else 0
+        
         # 计算最大回撤
         cumulative_pnl = 0
         peak = 0
@@ -452,9 +548,9 @@ class RBreakerStrategy:
         annual_return = 0
         annual_volatility = 0
         
-        if len(daily_pnl) > 1 and self.initial_capital > 0:
+        if len(daily_pnl) > 1 and self.config.initial_capital > 0:
             # 计算每日收益率（百分比）
-            daily_returns = [pnl / self.initial_capital for pnl in daily_pnl]
+            daily_returns = [pnl / self.config.initial_capital for pnl in daily_pnl]
             
             avg_daily_return = np.mean(daily_returns)
             std_daily_return = np.std(daily_returns, ddof=1)  # 样本标准差
@@ -479,12 +575,35 @@ class RBreakerStrategy:
             first_price = self.trades[0].price
             last_price = self.trades[-1].price
             buy_hold_return = ((last_price - first_price) / first_price) * 100
-            buy_hold_pnl = (last_price - first_price) * self.max_position_size  # 假设买入最大持仓数量
+            # 计算买入持有策略的股数（使用初始资金全仓买入）
+            shares_bought = int(self.config.initial_capital / first_price)
+            buy_hold_pnl = (last_price - first_price) * shares_bought
             
             strategy_vs_hold = total_return - buy_hold_return
             alpha = strategy_vs_hold  # 超额收益
         
+        # 计算费率统计
+        total_commission = sum(t.commission for t in self.trades)
+        commission_percent = (total_commission / self.config.initial_capital) * 100 if self.config.initial_capital > 0 else 0
+        
+        # 计算净收益（扣除费率后）
+        net_pnl = total_pnl - total_commission
+        net_return = (net_pnl / self.config.initial_capital) * 100 if self.config.initial_capital > 0 else 0
+        
+        # 最终资金
+        final_capital = self.current_capital
+        capital_return = ((final_capital - self.config.initial_capital) / self.config.initial_capital) * 100 if self.config.initial_capital > 0 else 0
+        
         return {
+            "资金管理": {
+                "初始资金": f"{self.config.initial_capital:.2f}",
+                "最终资金": f"{final_capital:.2f}",
+                "资金收益率": f"{capital_return:.2f}%",
+                "总交易费用": f"{total_commission:.2f}",
+                "费率占比": f"{commission_percent:.3f}%",
+                "净盈亏": f"{net_pnl:.2f}",
+                "净收益率": f"{net_return:.2f}%"
+            },
             "基础统计": {
                 "总交易次数": total_trades,
                 "盈利交易": profitable_trades,
@@ -516,6 +635,18 @@ class RBreakerStrategy:
                 "持仓盈亏": f"{buy_hold_pnl:.2f}"
             },
             "交易类型分析": trade_types,
+            "多空统计": {
+                "做多交易次数": long_trades,
+                "做空交易次数": short_trades,
+                "做多比例": f"{long_ratio:.2f}%",
+                "做空比例": f"{short_ratio:.2f}%",
+                "做多总盈亏": f"{long_pnl:.2f}",
+                "做空总盈亏": f"{short_pnl:.2f}",
+                "做多胜率": f"{long_win_rate:.2f}%",
+                "做空胜率": f"{short_win_rate:.2f}%",
+                "做多平均盈亏": f"{avg_long_pnl:.2f}",
+                "做空平均盈亏": f"{avg_short_pnl:.2f}"
+            },
             "每日统计": daily_stats
         }
     
@@ -524,6 +655,12 @@ class RBreakerStrategy:
         print("\n" + "="*60)
         print("         BABA R-Breaker策略统计报告")
         print("="*60)
+        
+        # 首先显示最终资金状况
+        print("\n💰 最终资金状况:")
+        print("-"*40)
+        for key, value in results["资金管理"].items():
+            print(f"{key:12}: {value}")
         
         # 打印基础统计
         print("\n📊 基础统计:")
@@ -552,6 +689,12 @@ class RBreakerStrategy:
             win_rate = stats['wins'] / stats['count'] * 100 if stats['count'] > 0 else 0
             print(f"{reason:15} {stats['count']:8} {stats['pnl']:10.2f} {win_rate:7.1f}%")
         
+        # 打印多空统计
+        print("\n📊 多空统计:")
+        print("-"*40)
+        for key, value in results["多空统计"].items():
+            print(f"{key:12}: {value}")
+        
         # 打印每日统计（前10天）
         print("\n📅 每日统计 (前10天):")
         print("-"*50)
@@ -565,25 +708,42 @@ class RBreakerStrategy:
         if len(results["每日统计"]) > 10:
             print(f"... 还有 {len(results['每日统计']) - 10} 天数据")
         
-        print(f"\n📋 总交易次数: {len(self.trades)} 笔")
+        # 单独打印总手续费
+        print("\n💰 手续费统计:")
+        print("=" * 50)
+        print(f"总交易次数: {len(self.trades)}")
+        print(f"总手续费消耗: ${self.total_commission:.2f}")
+        print(f"平均每笔手续费: ${self.total_commission/len(self.trades):.2f}" if len(self.trades) > 0 else "平均每笔手续费: $0.00")
 
 def main():
     """主函数"""
-    strategy = RBreakerStrategy()
+    # 创建策略配置
+    config = StrategyConfig()
+    
+    # 打印配置参数
+    print("🔧 策略配置参数:")
+    print("="*50)
+    config.print_config()
+    print("="*50)
+    
+    # 创建策略实例
+    strategy = RBreakerStrategy(config)
     
     # 回测参数
-    symbol = "QQQ.US"  # 阿里巴巴美股代码（longport格式）
+    symbol = config.symbol  # 使用配置中的交易标的
     end_date = date.today()
-    start_date = end_date - timedelta(days=600)  # 回测最近365天（1年）
+    start_date = end_date - timedelta(days=config.backtest_days)  # 使用配置中的回测天数
     
-    print(f"开始BABA R-Breaker策略回测")
+    print(f"开始 {symbol} R-Breaker策略回测")
     print(f"回测期间: {start_date} 到 {end_date}")
     print(f"策略参数:")
-    print(f"  突破系数: {strategy.f1}")
-    print(f"  观察系数: {strategy.f2}, {strategy.f4}")
-    print(f"  反转系数: {strategy.f3}, {strategy.f5}")
-    print(f"  止损比例: {strategy.stop_loss_percent*100}%")
-    print(f"  最大持仓时间: {strategy.max_hold_minutes}分钟")
+    print(f"  突破系数: {config.f1}")
+    print(f"  观察系数: {config.f2}, {config.f4}")
+    print(f"  反转系数: {config.f3}, {config.f5}")
+    print(f"  止损比例: {config.stop_loss_percent*100}%")
+    print(f"  最大持仓时间: {config.max_hold_minutes}分钟")
+    print(f"  最大重试次数: {config.max_retries}")
+    print(f"  重试间隔: {config.retry_delay}秒")
     
     # 运行回测
     results = strategy.run_backtest(symbol, start_date, end_date)
