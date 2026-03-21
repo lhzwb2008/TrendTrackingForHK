@@ -9,10 +9,12 @@
 3. 所有数据访问都通过这个管理器
 """
 
+import os
+import time
 import pandas as pd
 import numpy as np
 from datetime import date, timedelta, datetime
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Union
 from dataclasses import dataclass
 
 
@@ -52,6 +54,8 @@ class HistoricalDataManager:
         
         api = HKStockAPI()
         loaded = 0
+        # 严格串行拉取，避免触发服务端限流/超时（非并发，仅节流）
+        pause = float(os.getenv('LONGPORT_REQUEST_PAUSE', '0.15'))
         
         for i, symbol in enumerate(symbols):
             print(f"\r加载数据: {i+1}/{len(symbols)} {symbol}", end='', flush=True)
@@ -65,6 +69,9 @@ class HistoricalDataManager:
                     loaded += 1
             except Exception as e:
                 pass
+            finally:
+                if pause > 0 and i + 1 < len(symbols):
+                    time.sleep(pause)
         
         print(f"\n成功加载: {loaded}/{len(symbols)} 只股票")
         return loaded
@@ -134,7 +141,8 @@ class HistoricalDataManager:
         min_price: float = 1.0,
         min_avg_turnover: float = 5000000,
         max_avg_turnover: float = 500000000,
-        lookback_days: int = 20
+        lookback_days: int = 20,
+        symbols_subset: Optional[Union[Set[str], List[str]]] = None,
     ) -> List[str]:
         """
         获取当前可交易的股票池（基于历史数据）
@@ -146,13 +154,19 @@ class HistoricalDataManager:
             min_avg_turnover: 最低N日均成交额
             max_avg_turnover: 最高N日均成交额
             lookback_days: 计算均值的天数
+            symbols_subset: 若指定，仅在这些代码中筛选（用于多样本对照实验）
             
         Returns:
             符合条件的股票代码列表
         """
         tradable = []
+        subset = set(symbols_subset) if symbols_subset is not None else None
         
-        for symbol in self._all_data.keys():
+        keys = self._all_data.keys()
+        if subset is not None:
+            keys = (s for s in keys if s in subset)
+        
+        for symbol in keys:
             df = self.get_history(symbol, lookback_days=lookback_days)
             if df is None or len(df) < lookback_days // 2:
                 continue
@@ -215,6 +229,29 @@ class HistoricalDataManager:
         df['avg_turnover_20d'] = df['turnover'].rolling(20).mean()
         
         return df
+    
+    def register_symbol_frame(self, symbol: str, df: pd.DataFrame) -> None:
+        """注册已构造好的日线（用于测试或注入基准）"""
+        d = df.copy()
+        d.index = pd.to_datetime(d.index)
+        d = d.sort_index()
+        self._all_data[symbol] = d
+    
+    def is_regime_bull(self, benchmark_symbol: str, ma_days: int = 200) -> bool:
+        """
+        大盘趋势过滤：昨日收盘是否在 long MA 之上（无未来函数，与 get_history 一致）。
+        数据不足时返回 False，不新开仓。
+        """
+        df = self.get_history(benchmark_symbol)
+        if df is None or len(df) < ma_days + 2:
+            return False
+        close = df['close'].astype(float)
+        ma = close.rolling(ma_days).mean()
+        last_c = close.iloc[-1]
+        last_ma = ma.iloc[-1]
+        if pd.isna(last_ma) or last_ma <= 0:
+            return False
+        return bool(last_c > last_ma)
 
 
 class BacktestEngine:
@@ -232,6 +269,12 @@ class BacktestEngine:
         self.stop_loss_pct = self.config.get('stop_loss_pct', 0.25)
         self.breakout_lookback = self.config.get('breakout_lookback', 120)
         self.volume_ratio_threshold = self.config.get('volume_ratio_threshold', 1.5)
+        self.use_regime_filter = self.config.get('use_regime_filter', False)
+        self.regime_benchmark = self.config.get('regime_benchmark', 'HSI.HK')
+        self.regime_ma_days = int(self.config.get('regime_ma_days', 200))
+        self.one_way_cost_rate = float(self.config.get('one_way_cost_rate', 0.0))
+        ss = self.config.get('symbols_subset')
+        self.symbols_subset: Optional[Set[str]] = set(ss) if ss else None
         
         # 账户状态
         self.initial_capital = self.config.get('initial_capital', 100000)
@@ -287,7 +330,7 @@ class BacktestEngine:
             self._check_sell_signals(current_date)
             
             # 获取当前可交易的股票池（基于历史数据）
-            tradable_pool = self.dm.get_tradable_pool()
+            tradable_pool = self.dm.get_tradable_pool(symbols_subset=self.symbols_subset)
             
             # 检查买入信号
             self._check_buy_signals(current_date, tradable_pool)
@@ -308,6 +351,10 @@ class BacktestEngine:
         """检查买入信号"""
         if len(self.positions) >= self.max_positions:
             return
+        
+        if self.use_regime_filter:
+            if not self.dm.is_regime_bull(self.regime_benchmark, self.regime_ma_days):
+                return
         
         for symbol in tradable_pool:
             if symbol in self.positions:
@@ -387,7 +434,8 @@ class BacktestEngine:
         if shares <= 0:
             return
         
-        cost = shares * price
+        fee = self.one_way_cost_rate
+        cost = shares * price * (1.0 + fee)
         self.cash -= cost
         
         self.positions[symbol] = {
@@ -406,7 +454,6 @@ class BacktestEngine:
             'reason': reason
         })
         
-        print(f"  [买入] {current_date} {symbol} @ {price:.2f}, {shares}股, {reason}") if self._verbose else None
     
     def _execute_sell(self, current_date: date, symbol: str, price: float, 
                       ratio: float, reason: str):
@@ -419,7 +466,8 @@ class BacktestEngine:
         if sell_shares <= 0:
             return
         
-        sell_amount = sell_shares * price
+        fee = self.one_way_cost_rate
+        sell_amount = sell_shares * price * (1.0 - fee)
         self.cash += sell_amount
         
         pnl_pct = (price / pos['buy_price'] - 1) * 100
@@ -432,9 +480,6 @@ class BacktestEngine:
             'shares': sell_shares,
             'reason': f"{reason}, 盈亏:{pnl_pct:+.1f}%"
         })
-        
-        if self._verbose:
-            print(f"  [卖出] {current_date} {symbol} @ {price:.2f}, {sell_shares}股, {pnl_pct:+.1f}%")
         
         pos['shares'] -= sell_shares
         if pos['shares'] <= 0:
@@ -516,6 +561,20 @@ class BacktestEngine:
         days = len(self.daily_values)
         annual_return = ((final / initial) ** (252 / max(days, 1)) - 1) * 100
         
+        # 日收益率序列 -> 年化 Sharpe（无风险利率按 0；与常见回测口径一致）
+        daily_rets = []
+        for i in range(1, len(values)):
+            prev, cur = values[i - 1], values[i]
+            if prev and prev > 0:
+                daily_rets.append(cur / prev - 1.0)
+        daily_rets_arr = np.array(daily_rets, dtype=float)
+        if len(daily_rets_arr) > 1 and np.std(daily_rets_arr, ddof=1) > 1e-12:
+            sharpe_ratio = float(
+                np.sqrt(252) * np.mean(daily_rets_arr) / np.std(daily_rets_arr, ddof=1)
+            )
+        else:
+            sharpe_ratio = 0.0
+        
         # 交易统计
         buys = [t for t in self.trades if t['action'] == 'BUY']
         sells = [t for t in self.trades if t['action'] == 'SELL']
@@ -530,6 +589,7 @@ class BacktestEngine:
             print(f"  总收益率: {total_return:+.2f}%")
             print(f"  年化收益: {annual_return:+.2f}%")
             print(f"  最大回撤: {max_dd:.2%}")
+            print(f"  年化Sharpe(日收益,Rf=0): {sharpe_ratio:.3f}")
             
             # 打印年度收益
             if yearly_returns:
@@ -577,21 +637,35 @@ class BacktestEngine:
                     if dd > bench_max_dd:
                         bench_max_dd = dd
                 
-                print(f"\n【恒生指数基准】")
-                print(f"  基准收益: {benchmark_return:+.2f}%")
-                print(f"  基准回撤: {bench_max_dd:.2%}")
-                print(f"\n【相对表现】")
-                print(f"  超额收益: {excess_return:+.2f}%")
-                if excess_return > 0:
-                    print(f"  结论: 策略跑赢恒生指数 {excess_return:.1f}个百分点")
-                else:
-                    print(f"  结论: 策略跑输恒生指数 {-excess_return:.1f}个百分点")
+                if verbose:
+                    print(f"\n【恒生指数基准】")
+                    print(f"  基准收益: {benchmark_return:+.2f}%")
+                    print(f"  基准回撤: {bench_max_dd:.2%}")
+                    print(f"\n【相对表现】")
+                    print(f"  超额收益: {excess_return:+.2f}%")
+                    if excess_return > 0:
+                        print(f"  结论: 策略跑赢恒生指数 {excess_return:.1f}个百分点")
+                    else:
+                        print(f"  结论: 策略跑输恒生指数 {-excess_return:.1f}个百分点")
         
         if verbose:
             print(f"\n【交易统计】")
             print(f"  买入次数: {len(buys)}")
             print(f"  卖出次数: {len(sells)}")
             print(f"  胜率: {win_rate:.1f}%")
+            
+            if self.trades:
+                print(f"\n【成交明细】共 {len(self.trades)} 笔")
+                print(f"{'#':>4} {'日期':12} {'方向':6} {'代码':10} {'价格':>10} {'数量':>8} {'成交金额':>14}  说明")
+                print("-" * 100)
+                for i, t in enumerate(self.trades, 1):
+                    px = float(t['price'])
+                    sh = int(t['shares'])
+                    amt = px * sh
+                    print(
+                        f"{i:4d} {t['date']:12} {t['action']:6} {t['symbol']:10} "
+                        f"{px:10.4f} {sh:8d} {amt:14,.2f}  {t.get('reason', '')}"
+                    )
         
             if self.positions:
                 print(f"\n【当前持仓】")
@@ -603,6 +677,7 @@ class BacktestEngine:
             'total_return': total_return,
             'annual_return': annual_return,
             'max_drawdown': max_dd * 100,
+            'sharpe_ratio': sharpe_ratio,
             'win_rate': win_rate,
             'trade_count': len(buys) + len(sells),
             'benchmark_return': benchmark_return,
@@ -648,12 +723,16 @@ def main():
     dm = HistoricalDataManager()
     
     # 2. 确定股票池（用一个宽泛的初始列表）
-    import os
-    if not os.path.exists('hk_all_stocks.csv'):
-        print("未找到市场数据文件")
+    universe_csv = (
+        'universe_hk_small_quality.csv'
+        if os.path.exists('universe_hk_small_quality.csv')
+        else 'hk_all_stocks.csv'
+    )
+    if not os.path.exists(universe_csv):
+        print("未找到市场数据文件（可先运行 build_universe.py 生成 universe_hk_small_quality.csv）")
         return
     
-    df = pd.read_csv('hk_all_stocks.csv')
+    df = pd.read_csv(universe_csv)
     df['code'] = df['代码'].astype(str).str.zfill(5)
     
     # 初始筛选：只排除明显不合适的（ETF等）
@@ -666,6 +745,7 @@ def main():
     if len(symbols) > 200:
         symbols = symbols[:200]
     
+    print(f"股票池文件: {universe_csv}")
     print(f"待加载股票: {len(symbols)}只")
     
     # 3. 加载数据 - 从2020年开始
@@ -713,12 +793,16 @@ def optimize_params():
     dm = HistoricalDataManager()
     
     # 2. 加载股票池
-    import os
-    if not os.path.exists('hk_all_stocks.csv'):
-        print("未找到市场数据文件")
+    universe_csv = (
+        'universe_hk_small_quality.csv'
+        if os.path.exists('universe_hk_small_quality.csv')
+        else 'hk_all_stocks.csv'
+    )
+    if not os.path.exists(universe_csv):
+        print("未找到市场数据文件（可先运行 build_universe.py）")
         return []
     
-    df = pd.read_csv('hk_all_stocks.csv')
+    df = pd.read_csv(universe_csv)
     df['code'] = df['代码'].astype(str).str.zfill(5)
     
     # 筛选
@@ -780,12 +864,14 @@ def optimize_params():
             'total_return': result['total_return'],
             'excess_return': result['excess_return'],
             'max_drawdown': result['max_drawdown'],
+            'sharpe_ratio': result.get('sharpe_ratio', 0.0),
             'win_rate': result['win_rate'],
             'positive_years': f"{positive_years}/{len(yearly)}",
             'yearly': yearly
         })
         
-        print(f"  收益: {result['total_return']:+.1f}% | 超额: {result['excess_return']:+.1f}% | 回撤: {result['max_drawdown']:.1f}% | 盈利年: {positive_years}/{len(yearly)}")
+        sr = result.get('sharpe_ratio', 0.0)
+        print(f"  收益: {result['total_return']:+.1f}% | 超额: {result['excess_return']:+.1f}% | 回撤: {result['max_drawdown']:.1f}% | Sharpe: {sr:.3f} | 盈利年: {positive_years}/{len(yearly)}")
     
     # 5. 排序并输出结果
     print("\n" + "="*60)
@@ -794,11 +880,11 @@ def optimize_params():
     
     results.sort(key=lambda x: x['excess_return'] or -999, reverse=True)
     
-    print(f"{'#':<3} {'策略':12} {'总收益':>10} {'超额收益':>10} {'最大回撤':>10} {'胜率':>8} {'盈利年':>8}")
-    print("-" * 70)
+    print(f"{'#':<3} {'策略':12} {'总收益':>10} {'超额收益':>10} {'最大回撤':>10} {'Sharpe':>8} {'胜率':>8} {'盈利年':>8}")
+    print("-" * 80)
     
     for i, r in enumerate(results):
-        print(f"{i+1:<3} {r['name']:12} {r['total_return']:>+9.1f}% {r['excess_return']:>+9.1f}% {r['max_drawdown']:>9.1f}% {r['win_rate']:>7.1f}% {r['positive_years']:>8}")
+        print(f"{i+1:<3} {r['name']:12} {r['total_return']:>+9.1f}% {r['excess_return']:>+9.1f}% {r['max_drawdown']:>9.1f}% {r['sharpe_ratio']:>8.3f} {r['win_rate']:>7.1f}% {r['positive_years']:>8}")
     
     # 输出最优策略的年度明细
     if results:

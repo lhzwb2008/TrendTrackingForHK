@@ -52,14 +52,30 @@ class HKStockAPI:
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         
-        # 初始化Longport配置
-        try:
-            self.config = Config.from_env()
-            self.quote_ctx = QuoteContext(self.config)
-            logger.info("港股数据API初始化成功")
-        except Exception as e:
-            logger.error(f"API初始化失败: {e}")
-            raise
+        # 初始化 Longport（连接易超时，与「并发」无关；此处串行重试扩大间隔）
+        init_retries = int(os.getenv('LONGPORT_INIT_RETRIES', '5'))
+        init_base_delay = float(os.getenv('LONGPORT_INIT_RETRY_DELAY', '2.0'))
+        last_err: Optional[Exception] = None
+        for attempt in range(init_retries):
+            try:
+                self.config = Config.from_env()
+                self.quote_ctx = QuoteContext(self.config)
+                logger.info("港股数据API初始化成功")
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                logger.warning(
+                    "API初始化失败 (%s/%s): %s",
+                    attempt + 1,
+                    init_retries,
+                    e,
+                )
+                if attempt < init_retries - 1:
+                    time.sleep(init_base_delay * (attempt + 1))
+        if last_err is not None:
+            logger.error(f"API初始化失败: {last_err}")
+            raise last_err
     
     def _call_with_retry(self, func, *args, **kwargs):
         """带重试机制的API调用"""
@@ -124,7 +140,8 @@ class HKStockAPI:
             df.set_index('date', inplace=True)
             df.sort_index(inplace=True)
             
-            logger.info(f"{symbol}: 成功获取 {len(df)} 条日线数据")
+            if os.getenv('LONGPORT_VERBOSE_PER_SYMBOL', '').lower() in ('1', 'true', 'yes'):
+                logger.info(f"{symbol}: 成功获取 {len(df)} 条日线数据")
             return df
             
         except Exception as e:
