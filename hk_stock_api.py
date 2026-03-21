@@ -38,6 +38,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+def _candle_ts_to_date(ts) -> date:
+    """Longport 返回的 timestamp 可能是 datetime、date 或时间戳。"""
+    if isinstance(ts, datetime):
+        return ts.date()
+    if isinstance(ts, date):
+        return ts
+    return datetime.fromtimestamp(ts).date()
+
+
+def _index_to_date(idx_min) -> date:
+    """索引元素转 date（兼容 Timestamp / date）。"""
+    if isinstance(idx_min, datetime):
+        return idx_min.date()
+    if isinstance(idx_min, date):
+        return idx_min
+    return pd.Timestamp(idx_min).date()
+
+
 class HKStockAPI:
     """港股数据API封装类"""
     
@@ -127,7 +145,7 @@ class HKStockAPI:
             data = []
             for candle in candles:
                 data.append({
-                    'date': candle.timestamp.date() if isinstance(candle.timestamp, datetime) else datetime.fromtimestamp(candle.timestamp).date(),
+                    'date': _candle_ts_to_date(candle.timestamp),
                     'open': float(candle.open),
                     'high': float(candle.high),
                     'low': float(candle.low),
@@ -139,6 +157,42 @@ class HKStockAPI:
             df = pd.DataFrame(data)
             df.set_index('date', inplace=True)
             df.sort_index(inplace=True)
+            # Longport 单次约 1000 根上限：向前分段合并，直到覆盖 start_date
+            max_merges = 20
+            merges = 0
+            while merges < max_merges:
+                earliest = _index_to_date(df.index.min())
+                if earliest <= start_date or len(df) < 900:
+                    break
+                prev_end = earliest - timedelta(days=1)
+                if prev_end < start_date:
+                    break
+                time.sleep(float(os.getenv('LONGPORT_REQUEST_PAUSE', '0.15')))
+                older = self._call_with_retry(
+                    self.quote_ctx.history_candlesticks_by_date,
+                    symbol,
+                    Period.Day,
+                    adjust,
+                    start_date,
+                    prev_end,
+                )
+                if not older or len(older) < 20:
+                    break
+                rows = []
+                for candle in older:
+                    rows.append({
+                        'date': _candle_ts_to_date(candle.timestamp),
+                        'open': float(candle.open),
+                        'high': float(candle.high),
+                        'low': float(candle.low),
+                        'close': float(candle.close),
+                        'volume': int(candle.volume),
+                        'turnover': float(candle.turnover)
+                    })
+                add = pd.DataFrame(rows).set_index('date').sort_index()
+                df = pd.concat([add, df]).sort_index()
+                df = df[~df.index.duplicated(keep='first')]
+                merges += 1
             
             if os.getenv('LONGPORT_VERBOSE_PER_SYMBOL', '').lower() in ('1', 'true', 'yes'):
                 logger.info(f"{symbol}: 成功获取 {len(df)} 条日线数据")

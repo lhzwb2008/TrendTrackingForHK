@@ -180,11 +180,7 @@ def try_prepare_live_dm(
     data_start: date = date(2019, 6, 1),
     end_d: Optional[date] = None,
 ) -> Optional[Tuple[HistoricalDataManager, pd.DataFrame, str]]:
-    csv_path = (
-        'universe_hk_small_quality.csv'
-        if os.path.exists('universe_hk_small_quality.csv')
-        else 'hk_all_stocks.csv'
-    )
+    csv_path = 'hk_all_stocks.csv'
     if not os.path.exists(csv_path):
         return None
     end_d = end_d or date.today()

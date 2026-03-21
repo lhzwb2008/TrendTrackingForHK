@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-历史数据管理器 - 严格防止未来函数
+历史数据管理器 - 严格防止未来函数（港股日K趋势突破回测）
+
+跨港股+美股见项目内 `dual_breakout_strategy.py`。
 
 核心原则：
 1. 在任何时间点T，只能访问T-1及之前的数据
@@ -723,13 +725,9 @@ def main():
     dm = HistoricalDataManager()
     
     # 2. 确定股票池（用一个宽泛的初始列表）
-    universe_csv = (
-        'universe_hk_small_quality.csv'
-        if os.path.exists('universe_hk_small_quality.csv')
-        else 'hk_all_stocks.csv'
-    )
+    universe_csv = 'hk_all_stocks.csv'
     if not os.path.exists(universe_csv):
-        print("未找到市场数据文件（可先运行 build_universe.py 生成 universe_hk_small_quality.csv）")
+        print("未找到 hk_all_stocks.csv（跨市场趋势突破见 dual_breakout_strategy.py）")
         return
     
     df = pd.read_csv(universe_csv)
@@ -793,13 +791,9 @@ def optimize_params():
     dm = HistoricalDataManager()
     
     # 2. 加载股票池
-    universe_csv = (
-        'universe_hk_small_quality.csv'
-        if os.path.exists('universe_hk_small_quality.csv')
-        else 'hk_all_stocks.csv'
-    )
+    universe_csv = 'hk_all_stocks.csv'
     if not os.path.exists(universe_csv):
-        print("未找到市场数据文件（可先运行 build_universe.py）")
+        print("未找到 hk_all_stocks.csv")
         return []
     
     df = pd.read_csv(universe_csv)

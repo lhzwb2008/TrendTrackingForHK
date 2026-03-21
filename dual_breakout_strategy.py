@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-港股 + 美股 日K 纯技术面趋势突破回测（无基本面、无小市值约束）
+港股 + 美股 日K 纯技术面趋势突破回测（无基本面）
 
-逻辑概要（可视为 Turtle / Donchian 类规则的简化版）：
-  入场：收盘价突破过去 N 日最高价（不含当日，已 shift）、成交量 ≥ 倍数×成交量均线、
-        收盘价在趋势均线之上（过滤下跌中的假突破）。
-  出场：固定止损；或收盘价跌破过去 M 日最低价（唐奇安下轨退出，趋势跟随）；
-        可选：亏损且跌破慢均线则清仓。
+【未来函数检查】
+- 回测日 T 仅使用「截止 T-1」的日线：`get_history` 过滤 index.date <= T-1。
+- 突破：`is_breakout = close > high_nd.shift(1)`，其中 `high_nd` 为滚动最高价；
+  在任意一日，与之比较的是「前一日的 N 日最高价」，不包含当日 high，无前视。
+- 唐奇安出场：`low_exit_level = rolling_min(low).shift(1)`，同样不包含当日 low。
+- 信号与成交：信号基于 T-1 收盘；成交价用该收盘价，等价于「在 T 日按昨收成交」的简化，
+  实盘中通常更差（滑点、开盘跳空），故回测往往偏乐观。
 
-说明：任何回测都不保证「长期有效」；需样本外、多市场状态与成本再验证。
+【效果为何可能「看起来很好」】
+- 股票池很小或偏大盘时，夏普/回撤会失真；扩大标的与加入成本后通常会弱化。
+- 年度收益若某自然年只有「较晚才开始记录的净值」，该年数字是「年内片段」而非整年开盘起算。
+
+说明：不保证长期有效；需样本外、多区间与手续费再验证。
 """
 
 from __future__ import annotations
@@ -403,6 +409,7 @@ class DualBreakoutEngine:
             print(f'  最大回撤: {max_dd:.2%}\n  年化Sharpe(Rf=0): {sharpe:.3f}')
             if yearly:
                 print('\n【年度收益】策略 vs 等权(恒指+SPY)归一基准')
+                print('  （首年若预热结束较晚，该年收益为「年内已有净值区间的首尾」非完整自然年）')
                 py = 0
                 for y in sorted(yearly.keys()):
                     r = yearly[y]
@@ -478,6 +485,19 @@ def main() -> None:
     load_syms = list(dict.fromkeys(symbols + ['HSI.HK', 'SPY.US']))
     print(f'加载 {len(load_syms)} 个代码日线 …')
     dm.load_stock_data(load_syms, data_start, end_date)
+
+    if symbols:
+        s0 = symbols[0]
+        raw = dm._all_data.get(s0)
+        if raw is not None and len(raw) > 0:
+            t0, t1 = raw.index.min().date(), raw.index.max().date()
+            print(f'行情覆盖（示例 {s0}）: {t0} ~ {t1} 共 {len(raw)} 根')
+            if t0 > start_bt:
+                print(
+                    f'注意: 最早数据晚于回测起点 {start_bt}，'
+                    f'净值与「年度收益」实际从 {t0.year} 年附近才有意义。'
+                    f'已启用 hk_stock_api 分段拉取以尽量延长历史。'
+                )
 
     hsi = load_hsi_data(data_start, end_date)
     spy = load_us_etf('SPY.US', data_start, end_date)
