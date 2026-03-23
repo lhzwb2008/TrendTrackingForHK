@@ -32,7 +32,6 @@ UNIVERSE_CSV = ""
 # 候选池来源：
 # - "csv"：仅使用 UNIVERSE_CSV 中的标的（或默认 example）
 # - "hsi_hstech_ipo"：恒指成分 ∪ 恒生科技成分（见下方 CSV）∪ 可选「近一年上市」新股（扫 hk_all + static_info）
-# - "hk_all"：从 HK_ALL_STOCKS_CSV 取前 HK_ALL_MAX 只（不推荐，仅兼容旧用法）
 UNIVERSE_MODE = 'hsi_hstech_ipo'
 
 # 恒指 / 恒生科技成分表（正式文件优先；若无则用 *.example.csv 样例，请定期从恒生指数官网更新）
