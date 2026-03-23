@@ -1,0 +1,588 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+训练脚本（与回测推理分离）：在训练期网格搜索，样本外验证；最优参数写入 JSON，
+之后可多次运行 `backtest.py` 加载该 JSON 做推理，无需重复训练。
+
+**默认仅 10 组参数**（5×2）；训练 CSV：`--out`；样本外摘要：`*_oos_best.csv`；
+策略参数 JSON：默认 `trained_strategy_params.json`（与 backtest.STRATEGY_PARAMS_JSON 一致）。
+
+用法:
+  python train_params.py                  # 默认 10 组 + 样本外 + 写 JSON
+  python train_params.py --quick          # 少量冒烟
+  python train_params.py --full           # 约 48 组粗网格（可选）
+  python train_params.py --refine-regime-off   # 约 36 组细网格（可选）
+  python train_params.py --skip-ipo       # 构建候选池时不扫新股
+  python train_params.py --no-save-strategy-json   # 不写 JSON
+
+训练/测试起止日在 backtest.py 的 `TRAIN_*` / `TEST_*`。
+
+性能：对网格内每种（突破窗口×唐奇安日）预计算全历史指标并按日切片，
+避免每日对全池重复 rolling；数据仍与逐日 `calculate_indicators` 一致。
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import itertools
+import json
+import os
+import sys
+import time
+from datetime import date, datetime, timedelta
+from typing import Any, Dict, List, Set, Tuple
+
+import pandas as pd
+
+# 复用 backtest 的配置与引擎
+import backtest as bt
+from hk_universe import build_hsi_hstech_ipo_universe
+
+
+def _save_trained_strategy_json(
+    path: str,
+    best_row: Dict[str, Any],
+    train_start: date,
+    train_end: date,
+    test_start: date,
+    test_end: date,
+    train_sharpe: float,
+    test_sharpe: float,
+) -> None:
+    payload = {
+        'version': 1,
+        'saved_at': datetime.now().isoformat(timespec='seconds'),
+        'train_period': {'start': str(train_start), 'end': str(train_end)},
+        'test_period': {'start': str(test_start), 'end': str(test_end)},
+        'metrics': {
+            'train_sharpe_best': train_sharpe,
+            'test_sharpe_oos': test_sharpe,
+        },
+        'params': {
+            'breakout_lookback': int(best_row['breakout_lookback']),
+            'stop_loss_pct': float(best_row['stop_loss_pct']),
+            'volume_ratio_threshold': float(best_row['volume_ratio_threshold']),
+            'use_regime_filter': bool(best_row['use_regime_filter']),
+            'vol_target_annual': float(best_row['vol_target_annual']),
+            'exit_donchian_days': int(best_row['exit_donchian_days']),
+        },
+    }
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _build_symbols(skip_ipo: bool) -> List[str]:
+    if bt.UNIVERSE_MODE != 'hsi_hstech_ipo':
+        print('train_params 当前仅针对 UNIVERSE_MODE=hsi_hstech_ipo，请在 backtest.py 中设置', file=sys.stderr)
+        sys.exit(1)
+    include_ipo = bt.INCLUDE_IPO_UNIVERSE and not skip_ipo
+    symbols, _ = build_hsi_hstech_ipo_universe(
+        hsi_csv=bt.HSI_CONSTITUENTS_CSV,
+        hstech_csv=bt.HSTECH_CONSTITUENTS_CSV,
+        hsi_example=bt.HSI_CONSTITUENTS_EXAMPLE,
+        hstech_example=bt.HSTECH_CONSTITUENTS_EXAMPLE,
+        hk_all_csv=bt.HK_ALL_STOCKS_CSV,
+        include_ipo=include_ipo,
+        ipo_max_age_days=bt.IPO_LISTING_MAX_AGE_DAYS,
+    )
+    if not symbols:
+        sys.exit('候选池为空')
+    return symbols
+
+
+def _load_dm_and_benchmark(symbols: List[str]) -> Tuple[Any, Any, date]:
+    """一次载入：从训练起点前 warmup 直至测试期末，供训练期扫参 + 测试期样本外回测。"""
+    load_end = bt.TEST_END if bt.TEST_END is not None else (bt.BACKTEST_END if bt.BACKTEST_END is not None else date.today())
+    data_start = bt.TRAIN_START - timedelta(days=bt.DATA_WARMUP_DAYS_BEFORE_START)
+
+    dm = bt.DualMarketDataManager()
+    load_syms = list(dict.fromkeys(symbols + ['HSI.HK', 'SPY.US']))
+    print(f'[扫描] 加载日线 {len(load_syms)} 个标的…', flush=True)
+    n = dm.load_stock_data(load_syms, data_start, load_end)
+    if n == 0:
+        sys.exit('未加载到任何标的日线')
+
+    hsi = dm._all_data.get('HSI.HK')
+    spy = dm._all_data.get('SPY.US')
+    if hsi is None or getattr(hsi, 'empty', True):
+        hsi = bt.load_hsi_data(data_start, load_end)
+    if spy is None or getattr(spy, 'empty', True):
+        spy = bt.load_us_etf('SPY.US', data_start, load_end)
+
+    blend = bt.build_blended_benchmark(hsi, spy)
+    print('[扫描] 数据就绪。', flush=True)
+    return dm, blend, load_end
+
+
+def _make_cfg(
+    symbols: List[str],
+    *,
+    breakout_lookback: int,
+    stop_loss_pct: float,
+    volume_ratio_threshold: float,
+    use_regime_filter: bool,
+    vol_target_annual: float,
+    exit_donchian_days: int | None = None,
+) -> dict:
+    base = bt.engine_config(symbols)
+    base['breakout_lookback'] = breakout_lookback
+    base['stop_loss_pct'] = stop_loss_pct
+    base['volume_ratio_threshold'] = volume_ratio_threshold
+    base['use_regime_filter'] = use_regime_filter
+    base['vol_target_annual'] = vol_target_annual
+    if exit_donchian_days is not None:
+        base['exit_donchian_days'] = exit_donchian_days
+    return base
+
+
+class IndCacheEngine(bt.DualBreakoutEngine):
+    """用预计算的全历史指标表按日切片，避免每日对全池重复 rolling（扫描可快两个数量级）。"""
+
+    def __init__(self, dm: Any, config: dict, ind_cache: Dict[Tuple[str, int, int], pd.DataFrame]) -> None:
+        super().__init__(dm, config)
+        self._ind_cache = ind_cache
+
+    def _ind(self, symbol: str):
+        key = (symbol, self.breakout_lookback, self.exit_donchian_days)
+        full = self._ind_cache.get(key)
+        if full is None:
+            return super()._ind(symbol)
+        if self.dm._current_date is None:
+            return None
+        cutoff = self.dm._current_date - timedelta(days=1)
+        d = pd.DatetimeIndex(full.index).date
+        sub = full.loc[d <= cutoff]
+        if sub is None or len(sub) < 2:
+            return None
+        return sub
+
+
+def _precompute_indicators(
+    dm: Any,
+    symbols: List[str],
+    breakouts: Set[int],
+    exits: Set[int],
+    *,
+    load_end: date,
+) -> Dict[Tuple[str, int, int], pd.DataFrame]:
+    dm.set_current_date(load_end + timedelta(days=1))
+    tp = int(bt.TREND_MA_PERIOD)
+    vp = int(bt.VOL_MA_PERIOD)
+    cache: Dict[Tuple[str, int, int], pd.DataFrame] = {}
+    for sym in symbols:
+        for brk in breakouts:
+            for ex in exits:
+                df = dm.calculate_indicators(
+                    sym,
+                    breakout_lookback=brk,
+                    trend_ma_period=tp,
+                    vol_ma_period=vp,
+                    exit_donchian_days=ex,
+                )
+                if df is not None and len(df) >= 2:
+                    cache[(sym, brk, ex)] = df
+    dm._current_date = None
+    return cache
+
+
+def _brk_exit_sets(grid: List[Dict[str, Any]], baseline_cfg: dict) -> Tuple[Set[int], Set[int]]:
+    brk = {g['breakout_lookback'] for g in grid}
+    ex = {g['exit_donchian_days'] for g in grid}
+    brk.add(int(baseline_cfg['breakout_lookback']))
+    ex.add(int(baseline_cfg['exit_donchian_days']))
+    return brk, ex
+
+
+def _run_one(
+    dm: Any,
+    blend: Any,
+    symbols: List[str],
+    start_bt: date,
+    end_date: date,
+    cfg: dict,
+    ind_cache: Dict[Tuple[str, int, int], pd.DataFrame] | None = None,
+) -> Dict[str, Any]:
+    if ind_cache is not None:
+        eng = IndCacheEngine(dm, cfg, ind_cache)
+    else:
+        eng = bt.DualBreakoutEngine(dm, cfg)
+    return eng.run(start_bt, end_date, benchmark_data=blend, verbose=False)
+
+
+def _grid_default_train() -> List[Dict[str, Any]]:
+    """默认 10 组：5×2（突破窗口 × 止损），关大盘、量比 1.2、波动目标 15%、唐奇安 20。"""
+    breakouts = [40, 44, 48, 52, 55]
+    stops = [0.08, 0.10]
+    rows = []
+    for b, s in itertools.product(breakouts, stops):
+        rows.append(
+            {
+                'breakout_lookback': b,
+                'stop_loss_pct': s,
+                'volume_ratio_threshold': 1.2,
+                'use_regime_filter': False,
+                'vol_target_annual': 0.15,
+                'exit_donchian_days': 20,
+            }
+        )
+    return rows
+
+
+def _grid_quick_smoke() -> List[Dict[str, Any]]:
+    """冒烟 3 组。"""
+    return [
+        {
+            'breakout_lookback': 45,
+            'stop_loss_pct': 0.08,
+            'volume_ratio_threshold': 1.2,
+            'use_regime_filter': False,
+            'vol_target_annual': 0.15,
+            'exit_donchian_days': 20,
+        },
+        {
+            'breakout_lookback': 52,
+            'stop_loss_pct': 0.10,
+            'volume_ratio_threshold': 1.2,
+            'use_regime_filter': False,
+            'vol_target_annual': 0.15,
+            'exit_donchian_days': 20,
+        },
+        {
+            'breakout_lookback': 48,
+            'stop_loss_pct': 0.09,
+            'volume_ratio_threshold': 1.2,
+            'use_regime_filter': False,
+            'vol_target_annual': 0.15,
+            'exit_donchian_days': 20,
+        },
+    ]
+
+
+def _grid_full() -> List[Dict[str, Any]]:
+    """可选粗网格 48 组。"""
+    breakouts = [45, 55, 65]
+    stops = [0.08, 0.12]
+    vols = [1.0, 1.2]
+    regimes = [True, False]
+    vtargets = [0.0, 0.15]
+    exits = [20]
+
+    rows = []
+    for b, s, v, rg, vt, ex in itertools.product(breakouts, stops, vols, regimes, vtargets, exits):
+        rows.append(
+            {
+                'breakout_lookback': b,
+                'stop_loss_pct': s,
+                'volume_ratio_threshold': v,
+                'use_regime_filter': rg,
+                'vol_target_annual': vt,
+                'exit_donchian_days': ex,
+            }
+        )
+    return rows
+
+
+def _grid_refine_regime_off() -> List[Dict[str, Any]]:
+    """粗扫之后：固定关大盘、关 reg，在突破窗口与止损附近细搜（6×6=36）。"""
+    breakouts = [40, 42, 45, 48, 50, 52]
+    stops = [0.07, 0.075, 0.08, 0.085, 0.09, 0.10]
+    vols = [1.2]
+    regimes = [False]
+    vtargets = [0.15]
+    exits = [20]
+
+    rows = []
+    for b, s, v, rg, vt, ex in itertools.product(breakouts, stops, vols, regimes, vtargets, exits):
+        rows.append(
+            {
+                'breakout_lookback': b,
+                'stop_loss_pct': s,
+                'volume_ratio_threshold': v,
+                'use_regime_filter': rg,
+                'vol_target_annual': vt,
+                'exit_donchian_days': ex,
+            }
+        )
+    return rows
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description='粗粒度参数扫描（夏普）')
+    ap.add_argument('--quick', action='store_true', help='3 组冒烟')
+    ap.add_argument(
+        '--full',
+        action='store_true',
+        help='约 48 组粗网格（可选；默认 10 组）',
+    )
+    ap.add_argument(
+        '--refine-regime-off',
+        action='store_true',
+        help='约 36 组细网格（brk/stop 局部；与 --quick/--full 互斥）',
+    )
+    ap.add_argument(
+        '--skip-ipo',
+        action='store_true',
+        help='构建候选池时不扫描新股（与 backtest 中 INCLUDE_IPO_UNIVERSE=False 等效）',
+    )
+    ap.add_argument(
+        '--out',
+        default='param_sweep_results.csv',
+        help='训练期网格结果 CSV 路径',
+    )
+    ap.add_argument(
+        '--out-strategy-json',
+        default=None,
+        metavar='PATH',
+        help='最优策略参数 JSON（默认与 backtest.STRATEGY_PARAMS_JSON 相同）',
+    )
+    ap.add_argument(
+        '--no-save-strategy-json',
+        action='store_true',
+        help='不写入 trained_strategy_params.json',
+    )
+    args = ap.parse_args()
+
+    mode_flags = sum(bool(x) for x in (args.quick, args.full, args.refine_regime_off))
+    if mode_flags > 1:
+        print('请只选其一：--quick / --full / --refine-regime-off', file=sys.stderr)
+        sys.exit(2)
+
+    skip_ipo = args.skip_ipo or os.getenv('PARAM_SWEEP_SKIP_IPO', '').lower() in ('1', 'true', 'yes')
+
+    if args.refine_regime_off:
+        grid = _grid_refine_regime_off()
+        print(f'[扫描] 组合数: {len(grid)}（模式=refine-regime-off）', flush=True)
+    elif args.full:
+        grid = _grid_full()
+        print(f'[扫描] 组合数: {len(grid)}（模式=full）', flush=True)
+    elif args.quick:
+        grid = _grid_quick_smoke()
+        print(f'[扫描] 组合数: {len(grid)}（模式=quick 冒烟）', flush=True)
+    else:
+        grid = _grid_default_train()
+        print(f'[扫描] 组合数: {len(grid)}（模式=default 训练 10 组）', flush=True)
+
+    symbols = _build_symbols(skip_ipo=skip_ipo)
+    print(f'[扫描] 候选池 {len(symbols)} 只', flush=True)
+
+    train_start, train_end = bt.TRAIN_START, bt.TRAIN_END
+    test_start, test_end = bt.TEST_START, bt.TEST_END
+    print(
+        f'[扫描] 训练期 {train_start} ~ {train_end} ｜ 测试期 {test_start} ~ {test_end}（样本外）',
+        flush=True,
+    )
+
+    dm, blend, load_end = _load_dm_and_benchmark(symbols)
+
+    # 基准：当前 backtest.py 顶层默认
+    baseline_cfg = bt.engine_config(symbols)
+    brk_set, ex_set = _brk_exit_sets(grid, baseline_cfg)
+    print(
+        f'[扫描] 预计算指标缓存（突破×唐奇安 = {len(brk_set)}×{len(ex_set)} 档 × {len(symbols)} 只）…',
+        flush=True,
+    )
+    ind_cache = _precompute_indicators(dm, symbols, brk_set, ex_set, load_end=load_end)
+    print(f'[扫描] 指标缓存条目 {len(ind_cache)}（键: 标的+突破日+唐奇安日）', flush=True)
+
+    try:
+        base_train = _run_one(dm, blend, symbols, train_start, train_end, baseline_cfg, ind_cache)
+        base_sharpe = float(base_train.get('sharpe_ratio', 0.0))
+    except Exception as e:
+        print(f'[扫描] 训练期基准回测失败: {e}', flush=True)
+        base_sharpe = 0.0
+
+    print(f'[扫描] 训练期基准（当前 backtest 默认参数）Sharpe: {base_sharpe:.4f}', flush=True)
+
+    results: List[Dict[str, Any]] = []
+    t0 = time.time()
+    for i, g in enumerate(grid, start=1):
+        cfg = _make_cfg(
+            symbols,
+            breakout_lookback=g['breakout_lookback'],
+            stop_loss_pct=g['stop_loss_pct'],
+            volume_ratio_threshold=g['volume_ratio_threshold'],
+            use_regime_filter=g['use_regime_filter'],
+            vol_target_annual=g['vol_target_annual'],
+            exit_donchian_days=g['exit_donchian_days'],
+        )
+        print(
+            f'[扫描] 开始 {i}/{len(grid)} 回测 brk={g["breakout_lookback"]} stop={g["stop_loss_pct"]} '
+            f'vr={g["volume_ratio_threshold"]} reg={g["use_regime_filter"]} vt={g["vol_target_annual"]} …',
+            flush=True,
+        )
+        try:
+            r = _run_one(dm, blend, symbols, train_start, train_end, cfg, ind_cache)
+            sh = float(r.get('sharpe_ratio', 0.0))
+            ann = float(r.get('annual_return', 0.0))
+            mdd = float(r.get('max_drawdown', 0.0))
+            tot = float(r.get('total_return', 0.0))
+            tc = int(r.get('trade_count', 0))
+        except Exception as e:
+            print(f'[扫描] {i}/{len(grid)} 失败: {e}', flush=True)
+            continue
+
+        d_sh = sh - base_sharpe
+        results.append(
+            {
+                **g,
+                'sharpe_ratio': sh,
+                'd_sharpe_vs_baseline': d_sh,
+                'annual_return': ann,
+                'max_drawdown': mdd,
+                'total_return': tot,
+                'trade_count': tc,
+            }
+        )
+        print(f'[扫描] 进度 {i}/{len(grid)} Sharpe={sh:.4f} Δ={d_sh:+.4f}', flush=True)
+
+    dt = time.time() - t0
+    print(f'[扫描] 耗时 {dt:.1f}s', flush=True)
+
+    if not results:
+        print('无有效结果', file=sys.stderr)
+        sys.exit(1)
+
+    results.sort(key=lambda x: x['sharpe_ratio'], reverse=True)
+
+    # 写 CSV
+    keys = list(results[0].keys())
+    with open(args.out, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=keys)
+        w.writeheader()
+        w.writerows(results)
+    print(f'[扫描] 已写入 {args.out}', flush=True)
+
+    # 控制台：提升最大的若干组
+    print('\n' + '=' * 72)
+    print('训练期：按夏普降序 TOP 12（相对训练期基准 ΔSharpe）')
+    print('=' * 72)
+    hdr = f"{'#':>3} {'Sharpe':>8} {'ΔSharpe':>9} {'年化%':>9} {'回撤%':>8} {'交易':>6} 参数摘要"
+    print(hdr)
+    print('-' * len(hdr))
+    for i, row in enumerate(results[:12], start=1):
+        summ = (
+            f"brk={row['breakout_lookback']} stop={row['stop_loss_pct']:.2f} "
+            f"vr={row['volume_ratio_threshold']:.1f} reg={row['use_regime_filter']} "
+            f"vt={row['vol_target_annual']:.2f} exit={row['exit_donchian_days']}"
+        )
+        print(
+            f"{i:3d} {row['sharpe_ratio']:8.4f} {row['d_sharpe_vs_baseline']:+9.4f} "
+            f"{row['annual_return']:+9.2f} {row['max_drawdown']:8.2f} {row['trade_count']:6d}  {summ}"
+        )
+
+    # 单参数敏感度：各维度取该维度下最佳夏普
+    print('\n' + '=' * 72)
+    print('粗看：各维度单独取「该维度内最优夏普」对应的参数值')
+    print('=' * 72)
+    for dim in (
+        'breakout_lookback',
+        'stop_loss_pct',
+        'volume_ratio_threshold',
+        'use_regime_filter',
+        'vol_target_annual',
+        'exit_donchian_days',
+    ):
+        best_val = None
+        best_sh = -1e9
+        for val in sorted(set(r[dim] for r in results), key=lambda x: (str(type(x)), x)):
+            sub = [r for r in results if r[dim] == val]
+            if not sub:
+                continue
+            mx = max(sub, key=lambda x: x['sharpe_ratio'])
+            if mx['sharpe_ratio'] > best_sh:
+                best_sh = mx['sharpe_ratio']
+                best_val = val
+        print(f'  {dim}: 当前网格内较优取值 ≈ {best_val!r}（该值下最高 Sharpe {best_sh:.4f}）')
+
+    # 训练期最优参数 → 测试期样本外
+    best_row = results[0]
+    best_cfg = _make_cfg(
+        symbols,
+        breakout_lookback=best_row['breakout_lookback'],
+        stop_loss_pct=best_row['stop_loss_pct'],
+        volume_ratio_threshold=best_row['volume_ratio_threshold'],
+        use_regime_filter=best_row['use_regime_filter'],
+        vol_target_annual=best_row['vol_target_annual'],
+        exit_donchian_days=best_row['exit_donchian_days'],
+    )
+    try:
+        oos = _run_one(dm, blend, symbols, test_start, test_end, best_cfg, ind_cache)
+        base_test = _run_one(dm, blend, symbols, test_start, test_end, baseline_cfg, ind_cache)
+        oos_sh = float(oos.get('sharpe_ratio', 0.0))
+        base_test_sh = float(base_test.get('sharpe_ratio', 0.0))
+    except Exception as e:
+        print(f'[扫描] 样本外回测失败: {e}', flush=True)
+        oos = {}
+        base_test = {}
+        oos_sh = 0.0
+        base_test_sh = 0.0
+
+    print('\n' + '=' * 72)
+    print('样本外（测试期）：训练夏普最优的一组参数')
+    print('=' * 72)
+    print(
+        f"  训练期最优 Sharpe: {best_row['sharpe_ratio']:.4f}  "
+        f"brk={best_row['breakout_lookback']} stop={best_row['stop_loss_pct']:.4f} "
+        f"vr={best_row['volume_ratio_threshold']:.2f} reg={best_row['use_regime_filter']} "
+        f"vt={best_row['vol_target_annual']:.2f} exit={best_row['exit_donchian_days']}"
+    )
+    print(f'  测试期 {test_start} ~ {test_end} 同参数 Sharpe: {oos_sh:.4f}')
+    if oos:
+        print(
+            f'  测试期年化%: {float(oos.get("annual_return", 0.0)):+.2f}  '
+            f'回撤%: {float(oos.get("max_drawdown", 0.0)):.2f} 交易: {int(oos.get("trade_count", 0))}'
+        )
+    print(f'  测试期默认基准参数 Sharpe: {base_test_sh:.4f}（对照）')
+    print('=' * 72)
+
+    oos_path = args.out.replace('.csv', '_oos_best.csv') if args.out.endswith('.csv') else args.out + '_oos_best.csv'
+    oos_row: Dict[str, Any] = {
+        'period': 'test_oos',
+        'train_start': str(train_start),
+        'train_end': str(train_end),
+        'test_start': str(test_start),
+        'test_end': str(test_end),
+        'train_sharpe_best': best_row['sharpe_ratio'],
+        'test_sharpe_same_params': oos_sh,
+        'test_sharpe_baseline': base_test_sh,
+        'test_annual_return': float(oos.get('annual_return', 0.0)) if oos else 0.0,
+        'test_max_drawdown': float(oos.get('max_drawdown', 0.0)) if oos else 0.0,
+        'test_trade_count': int(oos.get('trade_count', 0)) if oos else 0,
+        'sharpe_ratio_train': best_row['sharpe_ratio'],
+    }
+    for k in (
+        'breakout_lookback',
+        'stop_loss_pct',
+        'volume_ratio_threshold',
+        'use_regime_filter',
+        'vol_target_annual',
+        'exit_donchian_days',
+    ):
+        oos_row[f'best_{k}'] = best_row[k]
+    with open(oos_path, 'w', newline='', encoding='utf-8') as f:
+        w = csv.DictWriter(f, fieldnames=list(oos_row.keys()))
+        w.writeheader()
+        w.writerow(oos_row)
+    print(f'[扫描] 样本外摘要已写入 {oos_path}', flush=True)
+
+    json_path = args.out_strategy_json or bt.STRATEGY_PARAMS_JSON
+    if not args.no_save_strategy_json:
+        try:
+            _save_trained_strategy_json(
+                json_path,
+                best_row,
+                train_start,
+                train_end,
+                test_start,
+                test_end,
+                float(best_row['sharpe_ratio']),
+                oos_sh,
+            )
+            print(f'[扫描] 已写入 {json_path}（运行 backtest.py 时将自动加载，可多次推理）', flush=True)
+        except OSError as e:
+            print(f'[扫描] 写入策略 JSON 失败: {e}', flush=True)
+
+
+if __name__ == '__main__':
+    main()

@@ -9,11 +9,12 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
 from datetime import date, datetime, timedelta
-from typing import Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Union
 
 import numpy as np
 import pandas as pd
@@ -22,9 +23,15 @@ import pandas as pd
 # 用户配置（修改此处即可）
 # =============================================================================
 
-# 回测区间（结束为 None 表示到今天）
-BACKTEST_START = date(2020, 1, 1)
-BACKTEST_END =  date(2026, 3, 1)  # 例: date(2025, 12, 31)
+# 样本划分：训练期仅含「2023 年以前」日线；测试期为 2024–2025 样本外（各脚本默认沿用）
+TRAIN_START = date(2020, 1, 1)
+TRAIN_END = date(2023, 12, 31)
+TEST_START = date(2024, 1, 1)
+TEST_END = date(2025, 12, 31)
+
+# 主回测区间（默认 = 测试期；结束为 None 表示到今天）
+BACKTEST_START = TEST_START
+BACKTEST_END = TEST_END  # 例: date(2025, 12, 31)
 
 # 股票池 CSV（symbol 列）。空字符串则依次尝试 dual_universe.csv、dual_universe.example.csv
 UNIVERSE_CSV = ""
@@ -56,9 +63,9 @@ INITIAL_CAPITAL = 100_000.0
 MAX_POSITIONS = 10
 POSITION_SIZE_PCT = 0.20  # 单笔目标占当时总权益比例（会再乘以下波动缩放）
 
-# —— 策略参数（当前为完整版默认：大盘过滤 + 波动目标仓位 + 移动止盈 + 紧止损）——
-STOP_LOSS_PCT = 0.10
-BREAKOUT_LOOKBACK = 55
+# —— 策略参数（若存在 trained_strategy_params.json 则由训练覆盖；否则用此处默认）——
+STOP_LOSS_PCT = 0.08
+BREAKOUT_LOOKBACK = 44
 TREND_MA_PERIOD = 50
 VOL_MA_PERIOD = 20
 VOLUME_RATIO_THRESHOLD = 1.2
@@ -66,8 +73,8 @@ EXIT_DONCHIAN_DAYS = 20
 USE_MA60_LOSS_EXIT = True
 ONE_WAY_COST_RATE = 0.0  # 单边费率，如万 3 填 0.00015（买/卖各收一次需自行理解口径）
 
-# 大盘过滤：恒指、SPY 均在长均线上方才允许新开仓
-USE_REGIME_FILTER = True
+# 大盘过滤：恒指、SPY 均在长均线上方才允许新开仓（训练选优为关）
+USE_REGIME_FILTER = False
 REGIME_BENCHMARKS: List[str] = ['HSI.HK', 'SPY.US']
 REGIME_MODE = 'all'  # 'all' = 全部在均线上；'any' = 任一在均线上
 REGIME_MA_DAYS = 200
@@ -91,6 +98,9 @@ US_AVG_TURNOVER_MAX = 50e9
 # 数据管理器：最少载入日线根数（过短则跳过该标的）
 MIN_HISTORY_DAYS_LOAD = 120
 MIN_HISTORY_DAYS_DUAL = 80  # 双市场池内有效数据下限（可略低于 LOAD）
+
+# 由 train_params.py 训练后写入；回测时若文件存在则覆盖下方策略常量（训练一次，多次推理）
+STRATEGY_PARAMS_JSON = os.environ.get('STRATEGY_PARAMS_JSON', 'trained_strategy_params.json')
 
 # =============================================================================
 
@@ -385,6 +395,7 @@ class DualBreakoutEngine:
         end_date: date,
         benchmark_data: Optional[pd.DataFrame] = None,
         verbose: bool = True,
+        compare_indices: Optional[Dict[str, pd.DataFrame]] = None,
     ) -> dict:
         self._verbose = verbose
         warmup = max(self.breakout_lookback, self.trend_ma_period, self.exit_donchian_days, 60) + 5
@@ -427,7 +438,7 @@ class DualBreakoutEngine:
             self._check_buy_signals(current_date, pool)
             self.daily_values.append((str(current_date), self.total_value))
 
-        return self._generate_report(benchmark_data, verbose)
+        return self._generate_report(benchmark_data, verbose, compare_indices)
 
     def _update_positions(self) -> None:
         for sym in list(self.positions.keys()):
@@ -601,7 +612,12 @@ class DualBreakoutEngine:
             out[year] = {'strategy': strat_ret, 'benchmark': bench_ret}
         return out
 
-    def _generate_report(self, benchmark_data: Optional[pd.DataFrame], verbose: bool) -> dict:
+    def _generate_report(
+        self,
+        benchmark_data: Optional[pd.DataFrame],
+        verbose: bool,
+        compare_indices: Optional[Dict[str, pd.DataFrame]] = None,
+    ) -> dict:
         initial = self.initial_capital
         final = self.total_value
         total_return = (final / initial - 1) * 100
@@ -659,7 +675,36 @@ class DualBreakoutEngine:
                 print(f'  盈利年份: {py}/{len(yearly)}')
             if bench_ret is not None:
                 print(f'\n【全样本基准】等权恒指+SPY: {bench_ret:+.2f}%  超额: {ex:+.2f}%')
+            if compare_indices and self.daily_values:
+                s0 = pd.to_datetime(self.daily_values[0][0])
+                s1 = pd.to_datetime(self.daily_values[-1][0])
+                print('\n【同期港股指数】回测区间首尾收盘，买入持有（与上表策略区间一致）')
+                idx_meta: Dict[str, float] = {}
+                for name, idf in compare_indices.items():
+                    if idf is None or getattr(idf, 'empty', True):
+                        print(f'  {name}: （无数据）')
+                        continue
+                    ir = buy_hold_return_pct(idf, s0, s1)
+                    if ir is None:
+                        print(f'  {name}: （区间内数据不足）')
+                        continue
+                    idx_meta[name] = ir
+                    ex_i = total_return - ir
+                    print(f'  {name}: {ir:+.2f}%  ｜ 策略相对该指数超额: {ex_i:+.2f}%')
+                if not idx_meta:
+                    print('  （恒指/恒生科技数据均未就绪）')
             print(f'\n【交易】买入{len(buys)} 卖出{len(sells)}  期末持仓{len(self.positions)}只')
+
+        idx_returns: Dict[str, float] = {}
+        if compare_indices and self.daily_values:
+            s0 = pd.to_datetime(self.daily_values[0][0])
+            s1 = pd.to_datetime(self.daily_values[-1][0])
+            for name, idf in compare_indices.items():
+                if idf is None or getattr(idf, 'empty', True):
+                    continue
+                ir = buy_hold_return_pct(idf, s0, s1)
+                if ir is not None:
+                    idx_returns[name] = ir
 
         return {
             'total_return': total_return,
@@ -671,6 +716,7 @@ class DualBreakoutEngine:
             'benchmark_return': bench_ret,
             'excess_return': ex,
             'yearly_returns': yearly,
+            'index_buy_hold_returns': idx_returns or None,
         }
 
 
@@ -681,6 +727,40 @@ def load_us_etf(symbol: str, start_date: date, end_date: date) -> Optional[pd.Da
     df = fetch_daily_bars(symbol, start_date, end_date, log_cache=True)
     time.sleep(pause)
     return df if df is not None and len(df) > 0 else None
+
+
+def buy_hold_return_pct(
+    df: Optional[pd.DataFrame],
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> Optional[float]:
+    """区间首尾收盘价涨跌幅（%），用于指数买入持有对比。"""
+    if df is None or getattr(df, 'empty', True):
+        return None
+    b = df.copy()
+    b.index = pd.to_datetime(b.index)
+    sub = b[(b.index >= start_ts) & (b.index <= end_ts)]
+    if len(sub) < 2:
+        return None
+    return float((sub['close'].iloc[-1] / sub['close'].iloc[0] - 1) * 100)
+
+
+def load_hstech_data(start_date: date, end_date: date) -> Optional[pd.DataFrame]:
+    """恒生科技指数：先试指数代码，再试跟踪 ETF。"""
+    from hk_stock_api import fetch_daily_bars
+
+    pause = float(os.getenv('LONGPORT_REQUEST_PAUSE', '0.15'))
+    for sym in ('HSTECH.HK', '03067.HK'):
+        try:
+            df = fetch_daily_bars(sym, start_date, end_date, log_cache=True)
+            time.sleep(pause)
+            if df is not None and len(df) > 0:
+                print(f'[回测] 恒生科技基准: {sym}，{len(df)} 条', flush=True)
+                return df
+        except Exception as e:
+            print(f'[回测] 加载 {sym} 失败: {e}', flush=True)
+    print('[回测] 未能加载恒生科技基准（HSTECH.HK / 03067.HK）', flush=True)
+    return None
 
 
 def build_blended_benchmark(hsi: Optional[pd.DataFrame], spy: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
@@ -753,8 +833,25 @@ def load_hk_all_symbol_list(path: str, max_n: int) -> List[str]:
     return syms[: max(0, max_n)]
 
 
+def load_trained_strategy_param_overrides() -> Dict[str, Any]:
+    """读取 train_params 写出的 JSON；不存在或解析失败则返回空 dict。"""
+    path = STRATEGY_PARAMS_JSON
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding='utf-8') as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    if 'params' in data and isinstance(data['params'], dict):
+        return dict(data['params'])
+    return {}
+
+
 def engine_config(symbols: List[str]) -> dict:
-    return {
+    cfg = {
         'initial_capital': INITIAL_CAPITAL,
         'max_positions': MAX_POSITIONS,
         'position_size_pct': POSITION_SIZE_PCT,
@@ -778,6 +875,13 @@ def engine_config(symbols: List[str]) -> dict:
         'trailing_stop_pct': TRAILING_STOP_PCT,
         'symbols_subset': set(symbols),
     }
+    ov = load_trained_strategy_param_overrides()
+    if ov:
+        for k, v in ov.items():
+            if k in cfg and k != 'symbols_subset':
+                cfg[k] = v
+    cfg['symbols_subset'] = set(symbols)
+    return cfg
 
 
 def main() -> None:
@@ -825,9 +929,14 @@ def main() -> None:
         print(f'候选池: CSV {uni}（{len(symbols)} 只）', flush=True)
 
     dm = DualMarketDataManager()
-    load_syms = list(dict.fromkeys(symbols + ['HSI.HK', 'SPY.US']))
+    load_syms = list(dict.fromkeys(symbols + ['HSI.HK', 'SPY.US', 'HSTECH.HK']))
     print(
         f'[回测] 加载 {len(load_syms)} 个标的日线（缓存在 data_cache/daily/，详见 README）',
+        flush=True,
+    )
+    print(
+        f'[回测] 请求区间：{data_start} ~ {end_date}（起点早于回测日约 {DATA_WARMUP_DAYS_BEFORE_START} 自然日，供指标预热；'
+        f'不产生 {start_bt} 以前的交易）。',
         flush=True,
     )
     dm.load_stock_data(load_syms, data_start, end_date)
@@ -837,7 +946,10 @@ def main() -> None:
         raw = dm._all_data.get(s0)
         if raw is not None and len(raw) > 0:
             t0, t1 = raw.index.min().date(), raw.index.max().date()
-            print(f'行情覆盖（示例 {s0}）: {t0} ~ {t1} 共 {len(raw)} 根')
+            print(
+                f'[回测] 示例 {s0} 缓存 K 线：{t0} ~ {t1} 共 {len(raw)} 根（可能早于请求起点，以缓存为准；'
+                f'策略决策仅从 {start_bt} 起）。'
+            )
             if t0 > start_bt:
                 print(
                     f'注意: 最早数据晚于回测起点 {start_bt}，净值与年度收益从 {t0.year} 年附近才有可比性。'
@@ -852,11 +964,36 @@ def main() -> None:
         print('[回测] SPY 未载入，尝试单独拉取…', flush=True)
         spy = load_us_etf('SPY.US', data_start, end_date)
 
+    hstech = dm._all_data.get('HSTECH.HK')
+    if hstech is None or getattr(hstech, 'empty', True):
+        print('[回测] 恒生科技未载入，尝试单独拉取…', flush=True)
+        hstech = load_hstech_data(data_start, end_date)
+
     blend = build_blended_benchmark(hsi, spy)
 
-    print('[回测] 数据就绪，开始回测。', flush=True)
+    compare_indices: Dict[str, pd.DataFrame] = {}
+    if hsi is not None and not getattr(hsi, 'empty', True):
+        compare_indices['恒生指数'] = hsi
+    if hstech is not None and not getattr(hstech, 'empty', True):
+        compare_indices['恒生科技'] = hstech
+
+    if load_trained_strategy_param_overrides():
+        print(
+            f'[回测] 已加载 {STRATEGY_PARAMS_JSON} 中的训练参数（覆盖 backtest 顶部常量）。',
+            flush=True,
+        )
+    print(
+        f'[回测] 数据就绪。**交易与净值统计区间**：{start_bt} ~ {end_date}（仅此段计入回测结果）。',
+        flush=True,
+    )
     eng = DualBreakoutEngine(dm, engine_config(symbols))
-    eng.run(start_bt, end_date, benchmark_data=blend, verbose=True)
+    eng.run(
+        start_bt,
+        end_date,
+        benchmark_data=blend,
+        verbose=True,
+        compare_indices=compare_indices if compare_indices else None,
+    )
 
 
 if __name__ == '__main__':
