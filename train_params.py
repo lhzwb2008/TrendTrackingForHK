@@ -44,7 +44,7 @@ from hk_universe import build_hsi_hstech_ipo_universe
 
 # 训练期（仅本脚本；2023 年及以前日线用于拟合参数）
 TRAIN_START = date(2020, 1, 1)
-TRAIN_END = date(2022, 12, 31)
+TRAIN_END = date(2023, 12, 31)
 
 
 def _save_trained_strategy_json(

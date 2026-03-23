@@ -1,21 +1,21 @@
 {
   "version": 1,
-  "saved_at": "2025-01-01T00:00:00",
+  "saved_at": "2026-03-23T17:07:24",
   "train_period": {
     "start": "2020-01-01",
-    "end": "2022-12-31"
+    "end": "2023-12-31"
   },
   "test_period": {
     "start": "2024-01-01",
     "end": "2025-12-31"
   },
   "metrics": {
-    "train_sharpe_best": 0.7037,
-    "test_sharpe_oos": 1.0124
+    "train_sharpe_best": 0.5952080368479673,
+    "test_sharpe_oos": 1.059849043438762
   },
   "params": {
-    "breakout_lookback": 44,
-    "stop_loss_pct": 0.08,
+    "breakout_lookback": 40,
+    "stop_loss_pct": 0.1,
     "volume_ratio_threshold": 1.2,
     "use_regime_filter": false,
     "vol_target_annual": 0.15,
