@@ -1,0 +1,864 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+港股 + 美股 日K 趋势突破回测（纯技术面）
+
+无未来函数要点：回测日 T 仅用截止 T-1 的日线；突破与通道均对前一日指标 shift(1)；
+成交价按昨收简化，实盘中通常更差。详见项目 README。
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import time
+from datetime import date, datetime, timedelta
+from typing import Dict, List, Optional, Set, Union
+
+import numpy as np
+import pandas as pd
+
+# =============================================================================
+# 用户配置（修改此处即可）
+# =============================================================================
+
+# 回测区间（结束为 None 表示到今天）
+BACKTEST_START = date(2020, 1, 1)
+BACKTEST_END =  date(2026, 3, 1)  # 例: date(2025, 12, 31)
+
+# 股票池 CSV（symbol 列）。空字符串则依次尝试 dual_universe.csv、dual_universe.example.csv
+UNIVERSE_CSV = ""
+
+# 候选池来源：
+# - "csv"：仅使用 UNIVERSE_CSV 中的标的（或默认 example）
+# - "hsi_hstech_ipo"：恒指成分 ∪ 恒生科技成分（见下方 CSV）∪ 可选「近一年上市」新股（扫 hk_all + static_info）
+# - "hk_all"：从 HK_ALL_STOCKS_CSV 取前 HK_ALL_MAX 只（不推荐，仅兼容旧用法）
+UNIVERSE_MODE = 'hsi_hstech_ipo'
+
+# 恒指 / 恒生科技成分表（正式文件优先；若无则用 *.example.csv 样例，请定期从恒生指数官网更新）
+HSI_CONSTITUENTS_CSV = 'data/hsi_constituents.csv'
+HSTECH_CONSTITUENTS_CSV = 'data/hstech_constituents.csv'
+HSI_CONSTITUENTS_EXAMPLE = 'data/hsi_constituents.example.csv'
+HSTECH_CONSTITUENTS_EXAMPLE = 'data/hstech_constituents.example.csv'
+
+# 新股池：对 HK_ALL_STOCKS_CSV 中全部代码请求 static_info，listing_date 在下列天数内则纳入
+HK_ALL_STOCKS_CSV = 'hk_all_stocks.csv'
+INCLUDE_IPO_UNIVERSE = True
+IPO_LISTING_MAX_AGE_DAYS = 365
+
+# 仅当 UNIVERSE_MODE = 'hk_all' 时生效
+HK_ALL_MAX = 200
+
+# 回测起点再往前多取的自然日（用于指标预热；REGIME_MA_DAYS=200 时建议 ≥400）
+DATA_WARMUP_DAYS_BEFORE_START = 400
+
+# 账户
+INITIAL_CAPITAL = 100_000.0
+MAX_POSITIONS = 10
+POSITION_SIZE_PCT = 0.20  # 单笔目标占当时总权益比例（会再乘以下波动缩放）
+
+# —— 策略参数（当前为完整版默认：大盘过滤 + 波动目标仓位 + 移动止盈 + 紧止损）——
+STOP_LOSS_PCT = 0.10
+BREAKOUT_LOOKBACK = 55
+TREND_MA_PERIOD = 50
+VOL_MA_PERIOD = 20
+VOLUME_RATIO_THRESHOLD = 1.2
+EXIT_DONCHIAN_DAYS = 20
+USE_MA60_LOSS_EXIT = True
+ONE_WAY_COST_RATE = 0.0  # 单边费率，如万 3 填 0.00015（买/卖各收一次需自行理解口径）
+
+# 大盘过滤：恒指、SPY 均在长均线上方才允许新开仓
+USE_REGIME_FILTER = True
+REGIME_BENCHMARKS: List[str] = ['HSI.HK', 'SPY.US']
+REGIME_MODE = 'all'  # 'all' = 全部在均线上；'any' = 任一在均线上
+REGIME_MA_DAYS = 200
+
+# 波动率目标：按标的实现波动缩放单笔仓位（0 表示关闭）
+VOL_TARGET_ANNUAL = 0.15
+VOL_LOOKBACK = 20
+VOL_SCALE_MIN = 0.35
+VOL_SCALE_MAX = 2.5
+
+# 移动止盈：浮盈达到比例后，自持仓以来最高价回撤超过比例则清仓（任一为 0 则关闭）
+TRAILING_ACTIVATION_PCT = 0.12
+TRAILING_STOP_PCT = 0.09
+
+# 流动性区间（近 lookback 日均成交额，港元/美元视市场而定）
+HK_AVG_TURNOVER_MIN = 5e6
+HK_AVG_TURNOVER_MAX = 50e9
+US_AVG_TURNOVER_MIN = 2e6
+US_AVG_TURNOVER_MAX = 50e9
+
+# 数据管理器：最少载入日线根数（过短则跳过该标的）
+MIN_HISTORY_DAYS_LOAD = 120
+MIN_HISTORY_DAYS_DUAL = 80  # 双市场池内有效数据下限（可略低于 LOAD）
+
+# =============================================================================
+
+
+class HistoricalDataManager:
+    """历史数据管理器：任意时刻 T 仅可见 T-1 及以前数据。"""
+
+    def __init__(self) -> None:
+        self._all_data: Dict[str, pd.DataFrame] = {}
+        self._current_date: Optional[date] = None
+        self._min_history_days: int = MIN_HISTORY_DAYS_LOAD
+
+    def load_stock_data(self, symbols: List[str], start_date: date, end_date: date) -> int:
+        from daily_cache import normalize_df_index
+        from hk_stock_api import fetch_daily_bars
+
+        loaded = 0
+        pause = float(os.getenv('LONGPORT_REQUEST_PAUSE', '0.15'))
+        for i, symbol in enumerate(symbols):
+            try:
+                df = fetch_daily_bars(
+                    symbol,
+                    start_date,
+                    end_date,
+                    log_cache=True,
+                    progress=(i + 1, len(symbols)),
+                )
+                if df is not None and len(df) > 0:
+                    df = normalize_df_index(df)
+                if df is not None and len(df) >= self._min_history_days:
+                    self._all_data[symbol] = df
+                    loaded += 1
+            except Exception as e:
+                print(f'[日线] {symbol} 加载异常: {e}', flush=True)
+            finally:
+                if pause > 0 and i + 1 < len(symbols):
+                    time.sleep(pause)
+        print(f'\n成功加载: {loaded}/{len(symbols)} 只股票')
+        if loaded == 0:
+            print(
+                '[提示] 若缓存 CSV 为旧版本导致切片为空，可删除 data_cache/daily/ 后重跑，'
+                '或设 TREND_DISABLE_DAILY_CACHE=1 强制走 API。',
+                flush=True,
+            )
+        return loaded
+
+    def set_current_date(self, current_date) -> None:
+        if isinstance(current_date, str):
+            current_date = pd.to_datetime(current_date).date()
+        elif isinstance(current_date, pd.Timestamp):
+            current_date = current_date.date()
+        self._current_date = current_date
+
+    def _get_cutoff_date(self) -> date:
+        if self._current_date is None:
+            raise ValueError('必须先调用 set_current_date()')
+        return self._current_date - timedelta(days=1)
+
+    def get_history(self, symbol: str, lookback_days: Optional[int] = None) -> Optional[pd.DataFrame]:
+        if symbol not in self._all_data:
+            return None
+        cutoff = self._get_cutoff_date()
+        df = self._all_data[symbol]
+        df_filtered = df[df.index.date <= cutoff].copy()
+        if len(df_filtered) < self._min_history_days:
+            return None
+        if lookback_days is not None:
+            df_filtered = df_filtered.tail(lookback_days)
+        return df_filtered
+
+    def get_latest_price(self, symbol: str) -> Optional[float]:
+        df = self.get_history(symbol, lookback_days=1)
+        if df is not None and len(df) > 0:
+            return float(df['close'].iloc[-1])
+        return None
+
+    def get_tradable_pool(
+        self,
+        min_price: float = 1.0,
+        min_avg_turnover: float = 5000000,
+        max_avg_turnover: float = 500000000,
+        lookback_days: int = 20,
+        symbols_subset: Optional[Union[Set[str], List[str]]] = None,
+    ) -> List[str]:
+        del min_avg_turnover, max_avg_turnover
+        tradable = []
+        subset = set(symbols_subset) if symbols_subset is not None else None
+        keys = self._all_data.keys()
+        if subset is not None:
+            keys = (s for s in keys if s in subset)
+        for symbol in keys:
+            df = self.get_history(symbol, lookback_days=lookback_days)
+            if df is None or len(df) < lookback_days // 2:
+                continue
+            latest_price = df['close'].iloc[-1]
+            avg_turnover = (df['close'] * df['volume']).mean()
+            if latest_price >= min_price and 5000000 <= avg_turnover <= 500000000:
+                tradable.append(symbol)
+        return tradable
+
+    def get_all_trading_dates(self) -> List[date]:
+        all_dates = set()
+        for df in self._all_data.values():
+            all_dates.update(df.index.date)
+        return sorted(all_dates)
+
+    def is_regime_bull(self, benchmark_symbol: str, ma_days: int = 200) -> bool:
+        df = self.get_history(benchmark_symbol)
+        if df is None or len(df) < ma_days + 2:
+            return False
+        close = df['close'].astype(float)
+        ma = close.rolling(ma_days).mean()
+        last_c = close.iloc[-1]
+        last_ma = ma.iloc[-1]
+        if pd.isna(last_ma) or last_ma <= 0:
+            return False
+        return bool(last_c > last_ma)
+
+
+class DualMarketDataManager(HistoricalDataManager):
+    """港股 / 美股分档成交额过滤。"""
+
+    def __init__(
+        self,
+        hk_turnover: tuple = None,
+        us_turnover: tuple = None,
+        min_history_days: int = None,
+    ) -> None:
+        super().__init__()
+        hk_turnover = hk_turnover or (HK_AVG_TURNOVER_MIN, HK_AVG_TURNOVER_MAX)
+        us_turnover = us_turnover or (US_AVG_TURNOVER_MIN, US_AVG_TURNOVER_MAX)
+        self._hk_lo, self._hk_hi = hk_turnover
+        self._us_lo, self._us_hi = us_turnover
+        self._min_history_days = min_history_days if min_history_days is not None else MIN_HISTORY_DAYS_DUAL
+
+    def _turn_bounds(self, symbol: str) -> tuple:
+        return (self._us_lo, self._us_hi) if symbol.endswith('.US') else (self._hk_lo, self._hk_hi)
+
+    def get_tradable_pool(
+        self,
+        min_price: float = 1.0,
+        min_avg_turnover: float = 5000000,
+        max_avg_turnover: float = 500000000,
+        lookback_days: int = 20,
+        symbols_subset: Optional[Union[Set[str], List[str]]] = None,
+    ) -> List[str]:
+        del min_avg_turnover, max_avg_turnover
+        tradable = []
+        subset = set(symbols_subset) if symbols_subset is not None else None
+        keys = self._all_data.keys()
+        if subset is not None:
+            keys = (s for s in keys if s in subset)
+        for symbol in keys:
+            if not (symbol.endswith('.HK') or symbol.endswith('.US')):
+                continue
+            df = self.get_history(symbol, lookback_days=lookback_days)
+            if df is None or len(df) < max(10, lookback_days // 2):
+                continue
+            latest_price = float(df['close'].iloc[-1])
+            avg_turnover = float((df['close'] * df['volume']).mean())
+            lo, hi = self._turn_bounds(symbol)
+            if latest_price >= min_price and lo <= avg_turnover <= hi:
+                tradable.append(symbol)
+        return tradable
+
+    def calculate_indicators(
+        self,
+        symbol: str,
+        breakout_lookback: int = 55,
+        trend_ma_period: int = 50,
+        vol_ma_period: int = 20,
+        exit_donchian_days: int = 20,
+    ) -> Optional[pd.DataFrame]:
+        df = self.get_history(symbol)
+        if df is None:
+            return None
+        df = df.copy()
+        df['ma_trend'] = df['close'].rolling(trend_ma_period).mean()
+        df['vol_ma'] = df['volume'].rolling(vol_ma_period).mean()
+        df['volume_ratio'] = df['volume'] / df['vol_ma'].replace(0, np.nan)
+        df['high_nd'] = df['high'].rolling(breakout_lookback).max()
+        df['is_breakout'] = df['close'] > df['high_nd'].shift(1)
+        df['trend_ok'] = df['close'] > df['ma_trend']
+        df['low_exit_level'] = df['low'].rolling(exit_donchian_days).min().shift(1)
+        df['turnover'] = df['close'] * df['volume']
+        df['avg_turnover_20d'] = df['turnover'].rolling(20).mean()
+        df['ma60'] = df['close'].rolling(60).mean()
+        return df
+
+
+class DualBreakoutEngine:
+    def __init__(self, dm: DualMarketDataManager, config: Optional[dict] = None) -> None:
+        self.dm = dm
+        self.config = config or {}
+        self.max_positions = int(self.config.get('max_positions', 10))
+        self.position_size_pct = float(self.config.get('position_size_pct', 0.10))
+        self.stop_loss_pct = float(self.config.get('stop_loss_pct', 0.12))
+        self.breakout_lookback = int(self.config.get('breakout_lookback', 55))
+        self.trend_ma_period = int(self.config.get('trend_ma_period', 50))
+        self.vol_ma_period = int(self.config.get('vol_ma_period', 20))
+        self.volume_ratio_threshold = float(self.config.get('volume_ratio_threshold', 1.2))
+        self.exit_donchian_days = int(self.config.get('exit_donchian_days', 20))
+        self.use_ma60_loss_exit = bool(self.config.get('use_ma60_loss_exit', True))
+        self.one_way_cost_rate = float(self.config.get('one_way_cost_rate', 0.0))
+        self.use_regime_filter = bool(self.config.get('use_regime_filter', False))
+        self.regime_benchmarks: List[str] = list(self.config.get('regime_benchmarks', ['HSI.HK', 'SPY.US']))
+        self.regime_mode = str(self.config.get('regime_mode', 'all')).lower()
+        self.regime_ma_days = int(self.config.get('regime_ma_days', 200))
+        self.vol_target_annual = float(self.config.get('vol_target_annual', 0.0))
+        self.vol_lookback = int(self.config.get('vol_lookback', 20))
+        self.vol_scale_min = float(self.config.get('vol_scale_min', 0.35))
+        self.vol_scale_max = float(self.config.get('vol_scale_max', 2.5))
+        self.trailing_activation_pct = float(self.config.get('trailing_activation_pct', 0.0))
+        self.trailing_stop_pct = float(self.config.get('trailing_stop_pct', 0.0))
+        ss = self.config.get('symbols_subset')
+        self.symbols_subset: Optional[Set[str]] = set(ss) if ss else None
+
+        self.initial_capital = float(self.config.get('initial_capital', 100000))
+        self.cash = self.initial_capital
+        self.positions: Dict = {}
+        self.trades: List[dict] = []
+        self.daily_values: List = []
+        self._verbose = True
+
+    def _min_buy_notional(self, symbol: str) -> float:
+        return 800.0 if symbol.endswith('.US') else 5000.0
+
+    def _regime_ok(self) -> bool:
+        if not self.use_regime_filter:
+            return True
+        conds = []
+        for sym in self.regime_benchmarks:
+            if sym not in self.dm._all_data:
+                continue
+            conds.append(self.dm.is_regime_bull(sym, self.regime_ma_days))
+        if not conds:
+            return True
+        return all(conds) if self.regime_mode == 'all' else any(conds)
+
+    def _ann_vol_symbol(self, symbol: str) -> float:
+        need = max(self.vol_lookback + 2, 5)
+        df = self.dm.get_history(symbol, lookback_days=need)
+        if df is None or len(df) < self.vol_lookback:
+            return 0.25
+        c = df['close'].astype(float).values
+        if len(c) < 2:
+            return 0.25
+        lr = np.diff(np.log(np.clip(c, 1e-12, None)))
+        if len(lr) < 5:
+            return 0.25
+        sig = float(np.std(lr, ddof=1) * np.sqrt(252.0))
+        return max(sig, 1e-6)
+
+    def _vol_scale(self, symbol: str) -> float:
+        if self.vol_target_annual <= 0:
+            return 1.0
+        av = self._ann_vol_symbol(symbol)
+        raw = self.vol_target_annual / av
+        return float(np.clip(raw, self.vol_scale_min, self.vol_scale_max))
+
+    def _shares_to_buy(self, symbol: str, buy_amount: float, price: float) -> int:
+        if price <= 0:
+            return 0
+        if symbol.endswith('.US'):
+            return max(1, int(buy_amount / price))
+        lot = int(buy_amount / price / 100) * 100
+        if lot <= 0:
+            lot = int(buy_amount / price)
+        return max(0, lot)
+
+    @property
+    def total_value(self) -> float:
+        pv = 0.0
+        for sym, pos in self.positions.items():
+            px = self.dm.get_latest_price(sym)
+            if px:
+                pv += pos['shares'] * px
+        return self.cash + pv
+
+    def _ind(self, symbol: str) -> Optional[pd.DataFrame]:
+        return self.dm.calculate_indicators(
+            symbol,
+            breakout_lookback=self.breakout_lookback,
+            trend_ma_period=self.trend_ma_period,
+            vol_ma_period=self.vol_ma_period,
+            exit_donchian_days=self.exit_donchian_days,
+        )
+
+    def run(
+        self,
+        start_date: date,
+        end_date: date,
+        benchmark_data: Optional[pd.DataFrame] = None,
+        verbose: bool = True,
+    ) -> dict:
+        self._verbose = verbose
+        warmup = max(self.breakout_lookback, self.trend_ma_period, self.exit_donchian_days, 60) + 5
+
+        all_dates = self.dm.get_all_trading_dates()
+        trading_dates = [d for d in all_dates if start_date <= d <= end_date]
+
+        if verbose:
+            print('\n' + '=' * 60)
+            print('双市场日K趋势突破')
+            print('=' * 60)
+            print(f'初始资金: {self.initial_capital:,.0f}  区间: {start_date} ~ {end_date}')
+            print(
+                f'参数: 突破{self.breakout_lookback}日高 | 趋势MA{self.trend_ma_period} | '
+                f'量比≥{self.volume_ratio_threshold} | 止损{self.stop_loss_pct:.0%} | '
+                f'唐奇安出场{self.exit_donchian_days}日低'
+            )
+            extra = []
+            if self.use_regime_filter:
+                extra.append(
+                    f'大盘过滤 {self.regime_mode}({",".join(self.regime_benchmarks)},{self.regime_ma_days}MA)'
+                )
+            if self.vol_target_annual > 0:
+                extra.append(f'波动目标{self.vol_target_annual:.0%}年化({self.vol_lookback}日)')
+            if self.trailing_activation_pct > 0 and self.trailing_stop_pct > 0:
+                extra.append(
+                    f'移动止盈 浮盈≥{self.trailing_activation_pct:.0%}后回撤{self.trailing_stop_pct:.0%}清仓'
+                )
+            if extra:
+                print('  ' + ' | '.join(extra))
+            print(f'交易日数: {len(trading_dates)}  预热跳过: {warmup} 天')
+
+        for i, current_date in enumerate(trading_dates):
+            self.dm.set_current_date(current_date)
+            if i < warmup:
+                continue
+            self._update_positions()
+            self._check_sell_signals(current_date)
+            pool = self.dm.get_tradable_pool(symbols_subset=self.symbols_subset)
+            self._check_buy_signals(current_date, pool)
+            self.daily_values.append((str(current_date), self.total_value))
+
+        return self._generate_report(benchmark_data, verbose)
+
+    def _update_positions(self) -> None:
+        for sym in list(self.positions.keys()):
+            px = self.dm.get_latest_price(sym)
+            if px:
+                self.positions[sym]['current_price'] = px
+                pk = self.positions[sym].get('peak_close', px)
+                self.positions[sym]['peak_close'] = max(pk, px)
+
+    def _check_buy_signals(self, current_date: date, pool: List[str]) -> None:
+        if len(self.positions) >= self.max_positions:
+            return
+        if not self._regime_ok():
+            return
+        for symbol in pool:
+            if symbol in self.positions or len(self.positions) >= self.max_positions:
+                continue
+            df = self._ind(symbol)
+            if df is None or len(df) < 2:
+                continue
+            row = df.iloc[-1]
+            if not row.get('is_breakout', False):
+                continue
+            vr = row.get('volume_ratio', 0) or 0
+            if vr < self.volume_ratio_threshold:
+                continue
+            if not row.get('trend_ok', False):
+                continue
+            avg_to = row.get('avg_turnover_20d', 0)
+            lo, _ = self.dm._turn_bounds(symbol)
+            if pd.isna(avg_to) or float(avg_to) < lo:
+                continue
+            px = float(row['close'])
+            vs = self._vol_scale(symbol)
+            self._execute_buy(
+                current_date,
+                symbol,
+                px,
+                f'突破{self.breakout_lookback}日高,量比{vr:.2f},>MA{self.trend_ma_period}',
+                size_scale=vs,
+            )
+
+    def _check_sell_signals(self, current_date: date) -> None:
+        for symbol in list(self.positions.keys()):
+            df = self._ind(symbol)
+            if df is None or len(df) < 1:
+                continue
+            row = df.iloc[-1]
+            pos = self.positions[symbol]
+            price = float(row['close'])
+            buy_price = pos['buy_price']
+            pnl_pct = price / buy_price - 1.0
+
+            if pnl_pct < -self.stop_loss_pct:
+                self._execute_sell(current_date, symbol, price, 1.0, f'止损 {pnl_pct:.1%}')
+                continue
+
+            if (
+                self.trailing_activation_pct > 0
+                and self.trailing_stop_pct > 0
+                and pnl_pct >= self.trailing_activation_pct
+            ):
+                peak = float(pos.get('peak_close', price))
+                if peak > 0 and (peak - price) / peak >= self.trailing_stop_pct:
+                    self._execute_sell(
+                        current_date,
+                        symbol,
+                        price,
+                        1.0,
+                        f'移动止盈 峰值回撤{(peak - price) / peak:.1%}',
+                    )
+                    continue
+
+            low_exit = row.get('low_exit_level')
+            if low_exit is not None and pd.notna(low_exit) and price < float(low_exit):
+                self._execute_sell(
+                    current_date,
+                    symbol,
+                    price,
+                    1.0,
+                    f'跌破{self.exit_donchian_days}日低 盈亏{pnl_pct:+.1%}',
+                )
+                continue
+
+            if self.use_ma60_loss_exit:
+                ma60 = row.get('ma60', 0)
+                if ma60 and ma60 > 0 and price < float(ma60) and pnl_pct < 0:
+                    self._execute_sell(current_date, symbol, price, 1.0, '跌破MA60且亏')
+
+    def _execute_buy(
+        self,
+        current_date: date,
+        symbol: str,
+        price: float,
+        reason: str,
+        size_scale: float = 1.0,
+    ) -> None:
+        max_amt = self.total_value * self.position_size_pct * float(size_scale)
+        buy_amt = min(self.cash * 0.92, max_amt)
+        min_b = self._min_buy_notional(symbol)
+        if buy_amt < min_b:
+            return
+        shares = self._shares_to_buy(symbol, buy_amt, price)
+        if shares <= 0:
+            return
+        fee = self.one_way_cost_rate
+        cost = shares * price * (1.0 + fee)
+        if cost > self.cash:
+            return
+        self.cash -= cost
+        self.positions[symbol] = {
+            'shares': shares,
+            'buy_price': price,
+            'buy_date': str(current_date),
+            'current_price': price,
+            'peak_close': price,
+        }
+        self.trades.append(
+            {
+                'date': str(current_date),
+                'action': 'BUY',
+                'symbol': symbol,
+                'price': price,
+                'shares': shares,
+                'reason': reason,
+            }
+        )
+
+    def _execute_sell(self, current_date: date, symbol: str, price: float, ratio: float, reason: str) -> None:
+        if symbol not in self.positions:
+            return
+        pos = self.positions[symbol]
+        sell_shares = int(pos['shares'] * ratio)
+        if sell_shares <= 0:
+            return
+        fee = self.one_way_cost_rate
+        self.cash += sell_shares * price * (1.0 - fee)
+        pnl_pct = (price / pos['buy_price'] - 1.0) * 100
+        self.trades.append(
+            {
+                'date': str(current_date),
+                'action': 'SELL',
+                'symbol': symbol,
+                'price': price,
+                'shares': sell_shares,
+                'reason': f'{reason}, 盈亏:{pnl_pct:+.1f}%',
+            }
+        )
+        pos['shares'] -= sell_shares
+        if pos['shares'] <= 0:
+            del self.positions[symbol]
+
+    def _calculate_yearly_returns(self, benchmark_data: Optional[pd.DataFrame]) -> dict:
+        yearly_data: Dict[int, list] = {}
+        for d, v in self.daily_values:
+            d_date = datetime.strptime(d, '%Y-%m-%d').date() if isinstance(d, str) else d
+            yearly_data.setdefault(d_date.year, []).append((d_date, v))
+        out = {}
+        for year, data in yearly_data.items():
+            if len(data) < 2:
+                continue
+            s0, s1 = data[0][1], data[-1][1]
+            strat_ret = (s1 / s0 - 1) * 100
+            bench_ret = 0.0
+            if benchmark_data is not None and len(benchmark_data) > 1:
+                b = benchmark_data.copy()
+                b.index = pd.to_datetime(b.index)
+                sub = b[(b.index >= pd.Timestamp(data[0][0])) & (b.index <= pd.Timestamp(data[-1][0]))]
+                if len(sub) > 1:
+                    bench_ret = (sub['close'].iloc[-1] / sub['close'].iloc[0] - 1) * 100
+            out[year] = {'strategy': strat_ret, 'benchmark': bench_ret}
+        return out
+
+    def _generate_report(self, benchmark_data: Optional[pd.DataFrame], verbose: bool) -> dict:
+        initial = self.initial_capital
+        final = self.total_value
+        total_return = (final / initial - 1) * 100
+        values = [v for _, v in self.daily_values]
+        max_dd = 0.0
+        peak = values[0] if values else initial
+        for v in values:
+            peak = max(peak, v)
+            max_dd = max(max_dd, (peak - v) / peak if peak else 0)
+        days = len(self.daily_values)
+        annual = ((final / initial) ** (252 / max(days, 1)) - 1) * 100
+        dr = []
+        for i in range(1, len(values)):
+            if values[i - 1] > 0:
+                dr.append(values[i] / values[i - 1] - 1.0)
+        arr = np.array(dr, dtype=float)
+        sharpe = (
+            float(np.sqrt(252) * np.mean(arr) / np.std(arr, ddof=1))
+            if len(arr) > 1 and np.std(arr, ddof=1) > 1e-12
+            else 0.0
+        )
+        neg = arr[arr < 0]
+        dstd = float(np.std(neg, ddof=1)) if len(neg) > 1 else 0.0
+        sortino = float(np.sqrt(252) * np.mean(arr) / dstd) if dstd > 1e-12 else 0.0
+
+        yearly = self._calculate_yearly_returns(benchmark_data)
+        bench_ret = ex = None
+        if benchmark_data is not None and self.daily_values:
+            b = benchmark_data.copy()
+            b.index = pd.to_datetime(b.index)
+            s0 = pd.to_datetime(self.daily_values[0][0])
+            s1 = pd.to_datetime(self.daily_values[-1][0])
+            sub = b[(b.index >= s0) & (b.index <= s1)]
+            if len(sub) > 1:
+                bench_ret = (sub['close'].iloc[-1] / sub['close'].iloc[0] - 1) * 100
+                ex = total_return - bench_ret
+
+        buys = [t for t in self.trades if t['action'] == 'BUY']
+        sells = [t for t in self.trades if t['action'] == 'SELL']
+
+        if verbose:
+            print('\n' + '=' * 60 + '\n回测结果\n' + '=' * 60)
+            print(f'\n【策略收益】\n  总收益率: {total_return:+.2f}%\n  年化收益: {annual:+.2f}%')
+            print(f'  最大回撤: {max_dd:.2%}\n  年化Sharpe(Rf=0): {sharpe:.3f}\n  年化Sortino(Rf=0): {sortino:.3f}')
+            if yearly:
+                print('\n【年度收益】策略 vs 等权(恒指+SPY)归一基准')
+                print('  （首年若预热结束较晚，该年收益为「年内已有净值区间的首尾」非完整自然年）')
+                py = 0
+                for y in sorted(yearly.keys()):
+                    r = yearly[y]
+                    ok = '✓' if r['strategy'] > 0 else '✗'
+                    if r['strategy'] > 0:
+                        py += 1
+                    print(f'  {y}: 策略{r["strategy"]:+.1f}% | 基准{r["benchmark"]:+.1f}% {ok}')
+                print(f'  盈利年份: {py}/{len(yearly)}')
+            if bench_ret is not None:
+                print(f'\n【全样本基准】等权恒指+SPY: {bench_ret:+.2f}%  超额: {ex:+.2f}%')
+            print(f'\n【交易】买入{len(buys)} 卖出{len(sells)}  期末持仓{len(self.positions)}只')
+
+        return {
+            'total_return': total_return,
+            'annual_return': annual,
+            'max_drawdown': max_dd * 100,
+            'sharpe_ratio': sharpe,
+            'sortino_ratio': sortino,
+            'trade_count': len(buys) + len(sells),
+            'benchmark_return': bench_ret,
+            'excess_return': ex,
+            'yearly_returns': yearly,
+        }
+
+
+def load_us_etf(symbol: str, start_date: date, end_date: date) -> Optional[pd.DataFrame]:
+    from hk_stock_api import fetch_daily_bars
+
+    pause = float(os.getenv('LONGPORT_REQUEST_PAUSE', '0.15'))
+    df = fetch_daily_bars(symbol, start_date, end_date, log_cache=True)
+    time.sleep(pause)
+    return df if df is not None and len(df) > 0 else None
+
+
+def build_blended_benchmark(hsi: Optional[pd.DataFrame], spy: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    if hsi is None or spy is None or hsi.empty or spy.empty:
+        return None
+    a = hsi.copy()
+    b = spy.copy()
+    a.index = pd.to_datetime(a.index)
+    b.index = pd.to_datetime(b.index)
+    merged = pd.merge(
+        a[['close']].rename(columns={'close': 'h'}),
+        b[['close']].rename(columns={'close': 's'}),
+        left_index=True,
+        right_index=True,
+        how='inner',
+    )
+    if len(merged) < 50:
+        return None
+    merged['h_n'] = merged['h'] / merged['h'].iloc[0] * 100.0
+    merged['s_n'] = merged['s'] / merged['s'].iloc[0] * 100.0
+    merged['close'] = (merged['h_n'] + merged['s_n']) / 2.0
+    return merged[['close']]
+
+
+def load_hsi_data(start_date: date, end_date: date) -> Optional[pd.DataFrame]:
+    from hk_stock_api import fetch_daily_bars
+
+    print('\n加载恒生指数数据...')
+    try:
+        df = fetch_daily_bars('HSI.HK', start_date, end_date, log_cache=True)
+        if df is not None and len(df) > 0:
+            print(f'恒生指数: {len(df)} 条数据')
+            return df
+    except Exception as e:
+        print(f'加载恒生指数失败: {e}')
+    try:
+        df = fetch_daily_bars('02800.HK', start_date, end_date, log_cache=True)
+        if df is not None and len(df) > 0:
+            print(f'使用盈富基金(02800.HK)作为基准: {len(df)} 条数据')
+            return df
+    except Exception as e:
+        print(f'加载盈富基金失败: {e}')
+    return None
+
+
+def load_universe_csv(path: str) -> List[str]:
+    df = pd.read_csv(path)
+    col = 'symbol' if 'symbol' in df.columns else '代码'
+    out = []
+    for raw in df[col].astype(str):
+        s = raw.strip()
+        if not s:
+            continue
+        if '.' not in s:
+            out.append(f'{s.zfill(5)}.HK')
+        else:
+            out.append(s.upper() if s.endswith(('.HK', '.US')) else s)
+    return list(dict.fromkeys(out))
+
+
+def load_hk_all_symbol_list(path: str, max_n: int) -> List[str]:
+    """从港股全表 CSV（含「代码」列）取前 max_n 个 .HK 代码。"""
+    if not os.path.exists(path):
+        return []
+    df = pd.read_csv(path)
+    if '代码' not in df.columns:
+        return []
+    codes = df['代码'].astype(str).str.replace(r'\.0$', '', regex=True).str.zfill(5)
+    syms = [f'{c}.HK' for c in codes.unique()]
+    return syms[: max(0, max_n)]
+
+
+def engine_config(symbols: List[str]) -> dict:
+    return {
+        'initial_capital': INITIAL_CAPITAL,
+        'max_positions': MAX_POSITIONS,
+        'position_size_pct': POSITION_SIZE_PCT,
+        'stop_loss_pct': STOP_LOSS_PCT,
+        'breakout_lookback': BREAKOUT_LOOKBACK,
+        'trend_ma_period': TREND_MA_PERIOD,
+        'vol_ma_period': VOL_MA_PERIOD,
+        'volume_ratio_threshold': VOLUME_RATIO_THRESHOLD,
+        'exit_donchian_days': EXIT_DONCHIAN_DAYS,
+        'use_ma60_loss_exit': USE_MA60_LOSS_EXIT,
+        'one_way_cost_rate': ONE_WAY_COST_RATE,
+        'use_regime_filter': USE_REGIME_FILTER,
+        'regime_benchmarks': REGIME_BENCHMARKS,
+        'regime_mode': REGIME_MODE,
+        'regime_ma_days': REGIME_MA_DAYS,
+        'vol_target_annual': VOL_TARGET_ANNUAL,
+        'vol_lookback': VOL_LOOKBACK,
+        'vol_scale_min': VOL_SCALE_MIN,
+        'vol_scale_max': VOL_SCALE_MAX,
+        'trailing_activation_pct': TRAILING_ACTIVATION_PCT,
+        'trailing_stop_pct': TRAILING_STOP_PCT,
+        'symbols_subset': set(symbols),
+    }
+
+
+def main() -> None:
+    end_date = BACKTEST_END if BACKTEST_END is not None else date.today()
+    start_bt = BACKTEST_START
+    data_start = start_bt - timedelta(days=DATA_WARMUP_DAYS_BEFORE_START)
+
+    if UNIVERSE_MODE == 'hsi_hstech_ipo':
+        from hk_universe import build_hsi_hstech_ipo_universe
+
+        try:
+            symbols, _desc = build_hsi_hstech_ipo_universe(
+                hsi_csv=HSI_CONSTITUENTS_CSV,
+                hstech_csv=HSTECH_CONSTITUENTS_CSV,
+                hsi_example=HSI_CONSTITUENTS_EXAMPLE,
+                hstech_example=HSTECH_CONSTITUENTS_EXAMPLE,
+                hk_all_csv=HK_ALL_STOCKS_CSV,
+                include_ipo=INCLUDE_IPO_UNIVERSE,
+                ipo_max_age_days=IPO_LISTING_MAX_AGE_DAYS,
+            )
+        except FileNotFoundError as e:
+            print(str(e), file=sys.stderr)
+            sys.exit(1)
+        if not symbols:
+            print('候选池为空：请检查成分 CSV 与新股开关', file=sys.stderr)
+            sys.exit(1)
+    elif UNIVERSE_MODE == 'hk_all':
+        symbols = load_hk_all_symbol_list(HK_ALL_STOCKS_CSV, HK_ALL_MAX)
+        uni = HK_ALL_STOCKS_CSV
+        if not symbols:
+            print(f'未从 {HK_ALL_STOCKS_CSV} 读到代码列「代码」，或文件不存在', file=sys.stderr)
+            sys.exit(1)
+        print(f'候选池: hk_all 模式，{uni} 前 {len(symbols)} 只港股', flush=True)
+    else:
+        uni = UNIVERSE_CSV.strip()
+        if not uni:
+            for cand in ('dual_universe.csv', 'dual_universe.example.csv'):
+                if os.path.exists(cand):
+                    uni = cand
+                    break
+        if not uni or not os.path.exists(uni):
+            print('未找到股票池 CSV：请设置 UNIVERSE_CSV 或放置 dual_universe.csv', file=sys.stderr)
+            sys.exit(1)
+        symbols = load_universe_csv(uni)
+        print(f'候选池: CSV {uni}（{len(symbols)} 只）', flush=True)
+
+    dm = DualMarketDataManager()
+    load_syms = list(dict.fromkeys(symbols + ['HSI.HK', 'SPY.US']))
+    print(
+        f'[回测] 加载 {len(load_syms)} 个标的日线（缓存在 data_cache/daily/，详见 README）',
+        flush=True,
+    )
+    dm.load_stock_data(load_syms, data_start, end_date)
+
+    if symbols:
+        s0 = symbols[0]
+        raw = dm._all_data.get(s0)
+        if raw is not None and len(raw) > 0:
+            t0, t1 = raw.index.min().date(), raw.index.max().date()
+            print(f'行情覆盖（示例 {s0}）: {t0} ~ {t1} 共 {len(raw)} 根')
+            if t0 > start_bt:
+                print(
+                    f'注意: 最早数据晚于回测起点 {start_bt}，净值与年度收益从 {t0.year} 年附近才有可比性。'
+                )
+
+    hsi = dm._all_data.get('HSI.HK')
+    spy = dm._all_data.get('SPY.US')
+    if hsi is None or getattr(hsi, 'empty', True):
+        print('[回测] 恒指未载入，尝试单独拉取…', flush=True)
+        hsi = load_hsi_data(data_start, end_date)
+    if spy is None or getattr(spy, 'empty', True):
+        print('[回测] SPY 未载入，尝试单独拉取…', flush=True)
+        spy = load_us_etf('SPY.US', data_start, end_date)
+
+    blend = build_blended_benchmark(hsi, spy)
+
+    print('[回测] 数据就绪，开始回测。', flush=True)
+    eng = DualBreakoutEngine(dm, engine_config(symbols))
+    eng.run(start_bt, end_date, benchmark_data=blend, verbose=True)
+
+
+if __name__ == '__main__':
+    main()

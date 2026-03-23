@@ -109,25 +109,14 @@ class HKStockAPI:
                     raise
         return None
     
-    def get_daily_data(
+    def _fetch_daily_range(
         self,
         symbol: str,
         start_date: date,
         end_date: date,
-        adjust: AdjustType = AdjustType.ForwardAdjust
+        adjust: AdjustType = AdjustType.ForwardAdjust,
     ) -> pd.DataFrame:
-        """
-        获取股票日线数据
-        
-        Args:
-            symbol: 股票代码，如 "00700.HK"
-            start_date: 开始日期
-            end_date: 结束日期
-            adjust: 复权类型，默认前复权
-            
-        Returns:
-            DataFrame包含以下列: open, high, low, close, volume, turnover
-        """
+        """单次（可多段合并）从 API 拉取 [start_date, end_date]，不写缓存。"""
         try:
             candles = self._call_with_retry(
                 self.quote_ctx.history_candlesticks_by_date,
@@ -135,29 +124,31 @@ class HKStockAPI:
                 Period.Day,
                 adjust,
                 start_date,
-                end_date
+                end_date,
             )
-            
+
             if not candles:
-                logger.warning(f"{symbol}: 未获取到数据")
+                # 合并缓存时可能对某子区间无数据，属正常；仅最终仍无数据时再在调用方体现
+                logger.debug('%s: 区间 %s~%s 首段无K线', symbol, start_date, end_date)
                 return pd.DataFrame()
-            
+
             data = []
             for candle in candles:
-                data.append({
-                    'date': _candle_ts_to_date(candle.timestamp),
-                    'open': float(candle.open),
-                    'high': float(candle.high),
-                    'low': float(candle.low),
-                    'close': float(candle.close),
-                    'volume': int(candle.volume),
-                    'turnover': float(candle.turnover)
-                })
-            
+                data.append(
+                    {
+                        'date': _candle_ts_to_date(candle.timestamp),
+                        'open': float(candle.open),
+                        'high': float(candle.high),
+                        'low': float(candle.low),
+                        'close': float(candle.close),
+                        'volume': int(candle.volume),
+                        'turnover': float(candle.turnover),
+                    }
+                )
+
             df = pd.DataFrame(data)
             df.set_index('date', inplace=True)
             df.sort_index(inplace=True)
-            # Longport 单次约 1000 根上限：向前分段合并，直到覆盖 start_date
             max_merges = 20
             merges = 0
             while merges < max_merges:
@@ -180,27 +171,46 @@ class HKStockAPI:
                     break
                 rows = []
                 for candle in older:
-                    rows.append({
-                        'date': _candle_ts_to_date(candle.timestamp),
-                        'open': float(candle.open),
-                        'high': float(candle.high),
-                        'low': float(candle.low),
-                        'close': float(candle.close),
-                        'volume': int(candle.volume),
-                        'turnover': float(candle.turnover)
-                    })
+                    rows.append(
+                        {
+                            'date': _candle_ts_to_date(candle.timestamp),
+                            'open': float(candle.open),
+                            'high': float(candle.high),
+                            'low': float(candle.low),
+                            'close': float(candle.close),
+                            'volume': int(candle.volume),
+                            'turnover': float(candle.turnover),
+                        }
+                    )
                 add = pd.DataFrame(rows).set_index('date').sort_index()
                 df = pd.concat([add, df]).sort_index()
                 df = df[~df.index.duplicated(keep='first')]
                 merges += 1
-            
+
             if os.getenv('LONGPORT_VERBOSE_PER_SYMBOL', '').lower() in ('1', 'true', 'yes'):
-                logger.info(f"{symbol}: 成功获取 {len(df)} 条日线数据")
-            return df
-            
+                logger.info(f'{symbol}: 成功获取 {len(df)} 条日线数据')
+            from daily_cache import normalize_df_index
+
+            return normalize_df_index(df)
+
         except Exception as e:
-            logger.error(f"{symbol}: 获取日线数据失败 - {e}")
+            logger.error(f'{symbol}: 获取日线数据失败 - {e}')
             return pd.DataFrame()
+
+    def get_daily_data(
+        self,
+        symbol: str,
+        start_date: date,
+        end_date: date,
+        adjust: AdjustType = AdjustType.ForwardAdjust,
+        log_cache: bool = True,
+        progress: Optional[Tuple[int, int]] = None,
+    ) -> pd.DataFrame:
+        """
+        获取股票日线数据（默认写入 data_cache/daily/*.csv，增量更新）。
+        实现委托给 fetch_daily_bars：仅在缓存未命中、需请求 API 时才初始化 Longport。
+        """
+        return fetch_daily_bars(symbol, start_date, end_date, adjust, log_cache, progress)
     
     def get_minute_data(
         self,
@@ -360,6 +370,65 @@ class HKStockAPI:
         except Exception as e:
             logger.error(f"{symbol}: 获取实时行情失败 - {e}")
             return None
+
+
+_api_singleton: Optional['HKStockAPI'] = None
+
+
+def _get_api_singleton() -> 'HKStockAPI':
+    global _api_singleton
+    if _api_singleton is None:
+        _api_singleton = HKStockAPI()
+    return _api_singleton
+
+
+def get_api_singleton() -> 'HKStockAPI':
+    """与 fetch_daily_bars 共用同一 Longport 实例；新股扫描等请用此接口避免重复初始化。"""
+    return _get_api_singleton()
+
+
+def fetch_daily_bars(
+    symbol: str,
+    start_date: date,
+    end_date: date,
+    adjust: AdjustType = AdjustType.ForwardAdjust,
+    log_cache: bool = True,
+    progress: Optional[Tuple[int, int]] = None,
+) -> pd.DataFrame:
+    """
+    拉取日线（带 CSV 缓存）。若本地缓存已覆盖区间，不会调用 fetch_range，也不会初始化 Longport。
+    """
+    from daily_cache import merge_daily_cache, normalize_df_index
+
+    if os.getenv('TREND_DISABLE_DAILY_CACHE', '').lower() in ('1', 'true', 'yes'):
+        df = _get_api_singleton()._fetch_daily_range(symbol, start_date, end_date, adjust)
+        df = normalize_df_index(df) if df is not None and len(df) else df
+        if df is None:
+            return pd.DataFrame()
+        if log_cache and progress:
+            pre = f'{progress[0]}/{progress[1]} ' if progress else ''
+            print(f'[日线] {pre}{symbol} — 无缓存 API {len(df)} 根', flush=True)
+        elif log_cache and not progress:
+            print(f'[日线] {symbol} — 无缓存 API {len(df)} 根', flush=True)
+        return df
+
+    def fetch_range(a: date, b: date) -> pd.DataFrame:
+        raw = _get_api_singleton()._fetch_daily_range(symbol, a, b, adjust)
+        if raw is None or len(raw) == 0:
+            return pd.DataFrame()
+        return normalize_df_index(raw)
+
+    df, _msg = merge_daily_cache(
+        symbol,
+        start_date,
+        end_date,
+        fetch_range,
+        log_cache=log_cache,
+        progress=progress,
+    )
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+    return normalize_df_index(df)
 
 
 def main():
