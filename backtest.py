@@ -23,15 +23,20 @@ import pandas as pd
 # 用户配置（修改此处即可）
 # =============================================================================
 
-# 样本划分：训练期仅含「2023 年以前」日线；测试期为 2024–2025 样本外（各脚本默认沿用）
-TRAIN_START = date(2020, 1, 1)
-TRAIN_END = date(2023, 12, 31)
-TEST_START = date(2024, 1, 1)
-TEST_END = date(2025, 12, 31)
-
-# 主回测区间（默认 = 测试期；结束为 None 表示到今天）
-BACKTEST_START = TEST_START
-BACKTEST_END = TEST_END  # 例: date(2025, 12, 31)
+# 主回测区间（推理；训练期仅在 train_params.py 配置）
+# 可用环境变量覆盖（便于一次性实验）：BACKTEST_START / BACKTEST_END，格式 YYYY-MM-DD
+_DEFAULT_BACKTEST_START = date(2024, 1, 1)
+_DEFAULT_BACKTEST_END = date(2025, 12, 31)
+BACKTEST_START = (
+    date.fromisoformat(os.environ['BACKTEST_START'])
+    if os.environ.get('BACKTEST_START')
+    else _DEFAULT_BACKTEST_START
+)
+BACKTEST_END = (
+    date.fromisoformat(os.environ['BACKTEST_END'])
+    if os.environ.get('BACKTEST_END')
+    else _DEFAULT_BACKTEST_END
+)  # 不设环境变量时也可在代码中改为 None 表示到今天
 
 # 股票池 CSV（symbol 列）。空字符串则依次尝试 dual_universe.csv、dual_universe.example.csv
 UNIVERSE_CSV = ""
@@ -680,6 +685,7 @@ class DualBreakoutEngine:
                 s1 = pd.to_datetime(self.daily_values[-1][0])
                 print('\n【同期港股指数】回测区间首尾收盘，买入持有（与上表策略区间一致）')
                 idx_meta: Dict[str, float] = {}
+                idx_excess: Dict[str, float] = {}
                 for name, idf in compare_indices.items():
                     if idf is None or getattr(idf, 'empty', True):
                         print(f'  {name}: （无数据）')
@@ -690,9 +696,30 @@ class DualBreakoutEngine:
                         continue
                     idx_meta[name] = ir
                     ex_i = total_return - ir
-                    print(f'  {name}: {ir:+.2f}%  ｜ 策略相对该指数超额: {ex_i:+.2f}%')
+                    idx_excess[name] = ex_i
+                    print(f'  {name}: 指数区间 {ir:+.2f}%  ｜ 策略超额 {ex_i:+.2f}%（= 策略总收益 {total_return:+.2f}% − 指数）')
                 if not idx_meta:
                     print('  （恒指/恒生科技数据均未就绪）')
+                elif len(idx_excess) >= 2:
+                    names = list(idx_excess.keys())
+                    # 典型为「恒生指数」「恒生科技」：并排对比两指数上的超额
+                    print('\n【超额收益对比】相对恒指 vs 相对恒生科技')
+                    print(f'  策略全区间总收益: {total_return:+.2f}%（与上方「总收益率」一致）')
+                    for n in names:
+                        ir = idx_meta.get(n)
+                        ex = idx_excess[n]
+                        ir_s = f'{ir:+.2f}%' if ir is not None else '—'
+                        print(f'  · {n}: 指数同期 {ir_s} → 超额 {ex:+.2f}%')
+                    hsi_n = next((k for k in idx_excess if '恒生指数' in k and '科技' not in k), None)
+                    hst_n = next((k for k in idx_excess if '科技' in k), None)
+                    if hsi_n and hst_n and hsi_n in idx_meta and hst_n in idx_meta:
+                        d_ex = idx_excess[hsi_n] - idx_excess[hst_n]
+                        d_idx = idx_meta[hsi_n] - idx_meta[hst_n]
+                        print(
+                            f'  说明：两指数同期涨跌差 {d_idx:+.2f}%（恒指−科技）；'
+                            f'策略相对两指数的超额之差 {d_ex:+.2f}%（= 相对恒指超额 − 相对科技超额）。'
+                            f'恒指跌得更多时，同一策略收益下「相对恒指超额」往往高于「相对科技超额」。'
+                        )
             print(f'\n【交易】买入{len(buys)} 卖出{len(sells)}  期末持仓{len(self.positions)}只')
 
         idx_returns: Dict[str, float] = {}
@@ -706,6 +733,10 @@ class DualBreakoutEngine:
                 if ir is not None:
                     idx_returns[name] = ir
 
+        excess_vs_indices: Optional[Dict[str, float]] = None
+        if idx_returns:
+            excess_vs_indices = {n: total_return - ir for n, ir in idx_returns.items()}
+
         return {
             'total_return': total_return,
             'annual_return': annual,
@@ -717,6 +748,7 @@ class DualBreakoutEngine:
             'excess_return': ex,
             'yearly_returns': yearly,
             'index_buy_hold_returns': idx_returns or None,
+            'excess_vs_indices': excess_vs_indices,
         }
 
 
@@ -831,6 +863,140 @@ def load_hk_all_symbol_list(path: str, max_n: int) -> List[str]:
     codes = df['代码'].astype(str).str.replace(r'\.0$', '', regex=True).str.zfill(5)
     syms = [f'{c}.HK' for c in codes.unique()]
     return syms[: max(0, max_n)]
+
+
+def load_hk_cn_name_map(path: str) -> Dict[str, str]:
+    """港股代码 -> 中文名称（来自 hk_all_stocks.csv「代码」「中文名称」列）。"""
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        df = pd.read_csv(path, encoding='utf-8-sig')
+    except (OSError, UnicodeDecodeError):
+        try:
+            df = pd.read_csv(path)
+        except OSError:
+            return {}
+    if '代码' not in df.columns or '中文名称' not in df.columns:
+        return {}
+    out: Dict[str, str] = {}
+    codes = df['代码'].astype(str).str.replace(r'\.0$', '', regex=True).str.zfill(5)
+    for sym, raw in zip(codes, df['中文名称'].astype(str)):
+        name = raw.strip()
+        if not name or name.lower() == 'nan':
+            continue
+        key = f'{sym}.HK'
+        if key not in out:
+            out[key] = name
+    return out
+
+
+def _fmt_trade_lines(
+    trades: List[Dict[str, Any]],
+    cn_map: Dict[str, str],
+    *,
+    position_size_pct: float,
+    max_positions: int,
+) -> List[str]:
+    """控制台用：多行文本。"""
+    lines: List[str] = []
+    lines.append('')
+    lines.append('=' * 120)
+    lines.append('【成交明细】')
+    lines.append(
+        f'  仓位规则：单标的买入额 ≈ min(现金×0.92, 当日总净值×{position_size_pct:.0%}×波动缩放)；'
+        f'最多同时 {max_positions} 只。下列「成交金额」为 股数×成交价（未含双边费用）。'
+    )
+    lines.append(
+        f'  {"#":>4} {"日期":12} {"方向":4} {"代码":12} {"中文名":12} {"股数":>8} {"价":>10} {"成交金额":>14}  备注'
+    )
+    lines.append('-' * 120)
+    for i, t in enumerate(trades, start=1):
+        sym = str(t.get('symbol', ''))
+        cn = (cn_map.get(sym, '') or '—')[:12]
+        sh = int(t.get('shares', 0))
+        px = float(t.get('price', 0.0))
+        amt = sh * px
+        act = str(t.get('action', ''))
+        dt = str(t.get('date', ''))
+        reason = str(t.get('reason', '')).replace('\n', ' ')
+        if len(reason) > 60:
+            reason = reason[:57] + '...'
+        lines.append(
+            f'  {i:4d} {dt:12} {act:4} {sym:12} {cn:12} {sh:8d} {px:10.4f} {amt:14,.2f}  {reason}'
+        )
+    lines.append('=' * 120)
+    return lines
+
+
+def print_trades_with_names(
+    trades: List[Dict[str, Any]],
+    cn_map: Dict[str, str],
+    config: Dict[str, Any],
+) -> None:
+    if not trades:
+        print('\n【成交明细】本区间无成交记录。')
+        return
+    ps = float(config.get('position_size_pct', 0.1))
+    mx = int(config.get('max_positions', 10))
+    for line in _fmt_trade_lines(trades, cn_map, position_size_pct=ps, max_positions=mx):
+        print(line, flush=True)
+
+
+def write_trades_csv(
+    trades: List[Dict[str, Any]],
+    cn_map: Dict[str, str],
+    path: str,
+) -> None:
+    """成交明细 CSV：含中文名、股数、价、名义成交金额、完整备注。"""
+    import csv as _csv
+
+    with open(path, 'w', newline='', encoding='utf-8-sig') as f:
+        w = _csv.writer(f)
+        w.writerow(
+            [
+                '序号',
+                '日期',
+                '方向',
+                '代码',
+                '中文名称',
+                '股数',
+                '成交价',
+                '成交金额_股数x价',
+                '备注',
+            ]
+        )
+        for i, t in enumerate(trades, start=1):
+            sym = str(t.get('symbol', ''))
+            cn = cn_map.get(sym, '') or ''
+            sh = int(t.get('shares', 0))
+            px = float(t.get('price', 0.0))
+            w.writerow(
+                [
+                    i,
+                    t.get('date', ''),
+                    t.get('action', ''),
+                    sym,
+                    cn,
+                    sh,
+                    f'{px:.6f}',
+                    f'{sh * px:.2f}',
+                    t.get('reason', ''),
+                ]
+            )
+
+
+def maybe_emit_trade_log(eng: 'DualBreakoutEngine', config: Dict[str, Any]) -> None:
+    """环境变量：BACKTEST_TRADE_LOG=1 打印明细；BACKTEST_TRADES_CSV=路径 写入 CSV。"""
+    want_print = os.environ.get('BACKTEST_TRADE_LOG', '').lower() in ('1', 'true', 'yes')
+    csv_path = (os.environ.get('BACKTEST_TRADES_CSV') or '').strip()
+    if not want_print and not csv_path:
+        return
+    cmap = load_hk_cn_name_map(HK_ALL_STOCKS_CSV)
+    if want_print:
+        print_trades_with_names(eng.trades, cmap, config)
+    if csv_path:
+        write_trades_csv(eng.trades, cmap, csv_path)
+        print(f'[回测] 成交明细 CSV: {csv_path}（共 {len(eng.trades)} 笔）', flush=True)
 
 
 def load_trained_strategy_param_overrides() -> Dict[str, Any]:
@@ -986,7 +1152,8 @@ def main() -> None:
         f'[回测] 数据就绪。**交易与净值统计区间**：{start_bt} ~ {end_date}（仅此段计入回测结果）。',
         flush=True,
     )
-    eng = DualBreakoutEngine(dm, engine_config(symbols))
+    cfg = engine_config(symbols)
+    eng = DualBreakoutEngine(dm, cfg)
     eng.run(
         start_bt,
         end_date,
@@ -994,6 +1161,7 @@ def main() -> None:
         verbose=True,
         compare_indices=compare_indices if compare_indices else None,
     )
+    maybe_emit_trade_log(eng, cfg)
 
 
 if __name__ == '__main__':

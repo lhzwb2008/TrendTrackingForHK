@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "saved_at": "2026-03-23T16:18:40",
+  "train_period": {
+    "start": "2024-01-01",
+    "end": "2025-12-31"
+  },
+  "test_period": {
+    "start": "2022-01-01",
+    "end": "2023-12-31"
+  },
+  "metrics": {
+    "train_sharpe_best": 1.2834095011404583,
+    "test_sharpe_oos": 0.03623379863838276
+  },
+  "params": {
+    "breakout_lookback": 52,
+    "stop_loss_pct": 0.08,
+    "volume_ratio_threshold": 1.2,
+    "use_regime_filter": false,
+    "vol_target_annual": 0.15,
+    "exit_donchian_days": 20
+  }
+}

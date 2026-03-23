@@ -14,8 +14,11 @@
   python train_params.py --refine-regime-off   # 约 36 组细网格（可选）
   python train_params.py --skip-ipo       # 构建候选池时不扫新股
   python train_params.py --no-save-strategy-json   # 不写 JSON
+  python train_params.py --train-start 2024-01-01 --train-end 2025-12-31 \\
+      --test-start 2022-01-01 --test-end 2023-12-31 --out-strategy-json exp.json
 
-训练/测试起止日在 backtest.py 的 `TRAIN_*` / `TEST_*`。
+训练期见本文件 `TRAIN_*`（可用 `--train-start`/`--train-end` 覆盖）；样本外区间默认与
+`backtest.BACKTEST_*` 一致（可用 `--test-start`/`--test-end` 覆盖）。
 
 性能：对网格内每种（突破窗口×唐奇安日）预计算全历史指标并按日切片，
 避免每日对全池重复 rolling；数据仍与逐日 `calculate_indicators` 一致。
@@ -38,6 +41,10 @@ import pandas as pd
 # 复用 backtest 的配置与引擎
 import backtest as bt
 from hk_universe import build_hsi_hstech_ipo_universe
+
+# 训练期（仅本脚本；2023 年及以前日线用于拟合参数）
+TRAIN_START = date(2020, 1, 1)
+TRAIN_END = date(2022, 12, 31)
 
 
 def _save_trained_strategy_json(
@@ -91,13 +98,21 @@ def _build_symbols(skip_ipo: bool) -> List[str]:
     return symbols
 
 
-def _load_dm_and_benchmark(symbols: List[str]) -> Tuple[Any, Any, date]:
-    """一次载入：从训练起点前 warmup 直至测试期末，供训练期扫参 + 测试期样本外回测。"""
-    load_end = bt.TEST_END if bt.TEST_END is not None else (bt.BACKTEST_END if bt.BACKTEST_END is not None else date.today())
-    data_start = bt.TRAIN_START - timedelta(days=bt.DATA_WARMUP_DAYS_BEFORE_START)
+def _load_dm_and_benchmark(
+    symbols: List[str],
+    train_start: date,
+    train_end: date,
+    test_start: date,
+    test_end: date,
+) -> Tuple[Any, Any, date]:
+    """一次载入：覆盖训练/测试两段，取最早起点前 warmup、最晚终点为 load_end。"""
+    earliest = min(train_start, test_start)
+    te = test_end if test_end is not None else date.today()
+    load_end = max(train_end, te)
+    data_start = earliest - timedelta(days=bt.DATA_WARMUP_DAYS_BEFORE_START)
 
     dm = bt.DualMarketDataManager()
-    load_syms = list(dict.fromkeys(symbols + ['HSI.HK', 'SPY.US']))
+    load_syms = list(dict.fromkeys(symbols + ['HSI.HK', 'SPY.US', 'HSTECH.HK']))
     print(f'[扫描] 加载日线 {len(load_syms)} 个标的…', flush=True)
     n = dm.load_stock_data(load_syms, data_start, load_end)
     if n == 0:
@@ -341,6 +356,10 @@ def main() -> None:
         action='store_true',
         help='不写入 trained_strategy_params.json',
     )
+    ap.add_argument('--train-start', type=str, default=None, metavar='YYYY-MM-DD', help='训练区间起点（覆盖默认 TRAIN_START）')
+    ap.add_argument('--train-end', type=str, default=None, metavar='YYYY-MM-DD', help='训练区间终点（覆盖默认 TRAIN_END）')
+    ap.add_argument('--test-start', type=str, default=None, metavar='YYYY-MM-DD', help='样本外区间起点（覆盖默认 BACKTEST_*）')
+    ap.add_argument('--test-end', type=str, default=None, metavar='YYYY-MM-DD', help='样本外区间终点（覆盖默认 BACKTEST_*）')
     args = ap.parse_args()
 
     mode_flags = sum(bool(x) for x in (args.quick, args.full, args.refine_regime_off))
@@ -366,14 +385,21 @@ def main() -> None:
     symbols = _build_symbols(skip_ipo=skip_ipo)
     print(f'[扫描] 候选池 {len(symbols)} 只', flush=True)
 
-    train_start, train_end = bt.TRAIN_START, bt.TRAIN_END
-    test_start, test_end = bt.TEST_START, bt.TEST_END
+    def _pd(s: str | None, default: date) -> date:
+        if not s:
+            return default
+        return date.fromisoformat(s.strip())
+
+    train_start = _pd(args.train_start, TRAIN_START)
+    train_end = _pd(args.train_end, TRAIN_END)
+    test_start = _pd(args.test_start, bt.BACKTEST_START)
+    test_end = _pd(args.test_end, bt.BACKTEST_END if bt.BACKTEST_END is not None else date.today())
     print(
         f'[扫描] 训练期 {train_start} ~ {train_end} ｜ 测试期 {test_start} ~ {test_end}（样本外）',
         flush=True,
     )
 
-    dm, blend, load_end = _load_dm_and_benchmark(symbols)
+    dm, blend, load_end = _load_dm_and_benchmark(symbols, train_start, train_end, test_start, test_end)
 
     # 基准：当前 backtest.py 顶层默认
     baseline_cfg = bt.engine_config(symbols)
