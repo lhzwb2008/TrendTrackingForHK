@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "saved_at": "2026-03-23T17:07:24",
+  "saved_at": "2026-03-24T12:40:00",
   "train_period": {
     "start": "2020-01-01",
     "end": "2023-12-31"
@@ -19,6 +19,11 @@
     "volume_ratio_threshold": 1.2,
     "use_regime_filter": false,
     "vol_target_annual": 0.15,
-    "exit_donchian_days": 20
+    "exit_donchian_days": 20,
+    "trend_ma_period": 50,
+    "vol_ma_period": 20,
+    "trailing_activation_pct": 0.12,
+    "trailing_stop_pct": 0.09,
+    "use_ma60_loss_exit": true
   }
 }

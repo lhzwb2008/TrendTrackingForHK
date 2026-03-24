@@ -69,8 +69,8 @@ MAX_POSITIONS = 10
 POSITION_SIZE_PCT = 0.20  # 单笔目标占当时总权益比例（会再乘以下波动缩放）
 
 # —— 策略参数（若存在 trained_strategy_params.json 则由训练覆盖；否则用此处默认）——
-STOP_LOSS_PCT = 0.08
-BREAKOUT_LOOKBACK = 44
+STOP_LOSS_PCT = 0.10
+BREAKOUT_LOOKBACK = 40
 TREND_MA_PERIOD = 50
 VOL_MA_PERIOD = 20
 VOLUME_RATIO_THRESHOLD = 1.2

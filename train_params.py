@@ -10,6 +10,8 @@
 用法:
   python train_params.py                  # 默认 10 组 + 样本外 + 写 JSON
   python train_params.py --quick          # 少量冒烟
+  python train_params.py --exp-v2         # 扩展网格：趋势MA×唐奇安×移动止盈（108 组）
+  python train_params.py --exp-v3         # 扩展网格：波动目标×MA60 离场（96 组）
   python train_params.py --full           # 约 48 组粗网格（可选）
   python train_params.py --refine-regime-off   # 约 36 组细网格（可选）
   python train_params.py --skip-ipo       # 构建候选池时不扫新股
@@ -57,6 +59,29 @@ def _save_trained_strategy_json(
     train_sharpe: float,
     test_sharpe: float,
 ) -> None:
+    params: Dict[str, Any] = {
+        'breakout_lookback': int(best_row['breakout_lookback']),
+        'stop_loss_pct': float(best_row['stop_loss_pct']),
+        'volume_ratio_threshold': float(best_row['volume_ratio_threshold']),
+        'use_regime_filter': bool(best_row['use_regime_filter']),
+        'vol_target_annual': float(best_row['vol_target_annual']),
+        'exit_donchian_days': int(best_row['exit_donchian_days']),
+    }
+    for k in (
+        'trend_ma_period',
+        'vol_ma_period',
+        'trailing_activation_pct',
+        'trailing_stop_pct',
+        'use_ma60_loss_exit',
+    ):
+        if k in best_row and best_row[k] is not None:
+            v = best_row[k]
+            if k == 'use_ma60_loss_exit':
+                params[k] = bool(v)
+            elif k in ('trend_ma_period', 'vol_ma_period'):
+                params[k] = int(v)
+            else:
+                params[k] = float(v)
     payload = {
         'version': 1,
         'saved_at': datetime.now().isoformat(timespec='seconds'),
@@ -66,14 +91,7 @@ def _save_trained_strategy_json(
             'train_sharpe_best': train_sharpe,
             'test_sharpe_oos': test_sharpe,
         },
-        'params': {
-            'breakout_lookback': int(best_row['breakout_lookback']),
-            'stop_loss_pct': float(best_row['stop_loss_pct']),
-            'volume_ratio_threshold': float(best_row['volume_ratio_threshold']),
-            'use_regime_filter': bool(best_row['use_regime_filter']),
-            'vol_target_annual': float(best_row['vol_target_annual']),
-            'exit_donchian_days': int(best_row['exit_donchian_days']),
-        },
+        'params': params,
     }
     with open(path, 'w', encoding='utf-8') as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
@@ -130,36 +148,52 @@ def _load_dm_and_benchmark(
     return dm, blend, load_end
 
 
-def _make_cfg(
-    symbols: List[str],
-    *,
-    breakout_lookback: int,
-    stop_loss_pct: float,
-    volume_ratio_threshold: float,
-    use_regime_filter: bool,
-    vol_target_annual: float,
-    exit_donchian_days: int | None = None,
-) -> dict:
+def _make_cfg_from_row(symbols: List[str], row: Dict[str, Any]) -> dict:
+    """从网格行合并到 engine_config；未出现的键沿用 backtest 默认 + 已加载 JSON。"""
     base = bt.engine_config(symbols)
-    base['breakout_lookback'] = breakout_lookback
-    base['stop_loss_pct'] = stop_loss_pct
-    base['volume_ratio_threshold'] = volume_ratio_threshold
-    base['use_regime_filter'] = use_regime_filter
-    base['vol_target_annual'] = vol_target_annual
-    if exit_donchian_days is not None:
-        base['exit_donchian_days'] = exit_donchian_days
+    if 'breakout_lookback' in row:
+        base['breakout_lookback'] = int(row['breakout_lookback'])
+    if 'stop_loss_pct' in row:
+        base['stop_loss_pct'] = float(row['stop_loss_pct'])
+    if 'volume_ratio_threshold' in row:
+        base['volume_ratio_threshold'] = float(row['volume_ratio_threshold'])
+    if 'use_regime_filter' in row:
+        base['use_regime_filter'] = bool(row['use_regime_filter'])
+    if 'vol_target_annual' in row:
+        base['vol_target_annual'] = float(row['vol_target_annual'])
+    if 'exit_donchian_days' in row:
+        base['exit_donchian_days'] = int(row['exit_donchian_days'])
+    if 'trend_ma_period' in row and row['trend_ma_period'] is not None:
+        base['trend_ma_period'] = int(row['trend_ma_period'])
+    if 'vol_ma_period' in row and row['vol_ma_period'] is not None:
+        base['vol_ma_period'] = int(row['vol_ma_period'])
+    if 'trailing_activation_pct' in row and row['trailing_activation_pct'] is not None:
+        base['trailing_activation_pct'] = float(row['trailing_activation_pct'])
+    if 'trailing_stop_pct' in row and row['trailing_stop_pct'] is not None:
+        base['trailing_stop_pct'] = float(row['trailing_stop_pct'])
+    if 'use_ma60_loss_exit' in row and row['use_ma60_loss_exit'] is not None:
+        base['use_ma60_loss_exit'] = bool(row['use_ma60_loss_exit'])
     return base
+
+
+IndCacheKey = Tuple[str, int, int, int, int]
 
 
 class IndCacheEngine(bt.DualBreakoutEngine):
     """用预计算的全历史指标表按日切片，避免每日对全池重复 rolling（扫描可快两个数量级）。"""
 
-    def __init__(self, dm: Any, config: dict, ind_cache: Dict[Tuple[str, int, int], pd.DataFrame]) -> None:
+    def __init__(self, dm: Any, config: dict, ind_cache: Dict[IndCacheKey, pd.DataFrame]) -> None:
         super().__init__(dm, config)
         self._ind_cache = ind_cache
 
     def _ind(self, symbol: str):
-        key = (symbol, self.breakout_lookback, self.exit_donchian_days)
+        key: IndCacheKey = (
+            symbol,
+            self.breakout_lookback,
+            self.exit_donchian_days,
+            self.trend_ma_period,
+            self.vol_ma_period,
+        )
         full = self._ind_cache.get(key)
         if full is None:
             return super()._ind(symbol)
@@ -178,35 +212,48 @@ def _precompute_indicators(
     symbols: List[str],
     breakouts: Set[int],
     exits: Set[int],
+    trend_periods: Set[int],
+    vol_periods: Set[int],
     *,
     load_end: date,
-) -> Dict[Tuple[str, int, int], pd.DataFrame]:
+) -> Dict[IndCacheKey, pd.DataFrame]:
     dm.set_current_date(load_end + timedelta(days=1))
-    tp = int(bt.TREND_MA_PERIOD)
-    vp = int(bt.VOL_MA_PERIOD)
-    cache: Dict[Tuple[str, int, int], pd.DataFrame] = {}
+    cache: Dict[IndCacheKey, pd.DataFrame] = {}
     for sym in symbols:
         for brk in breakouts:
             for ex in exits:
-                df = dm.calculate_indicators(
-                    sym,
-                    breakout_lookback=brk,
-                    trend_ma_period=tp,
-                    vol_ma_period=vp,
-                    exit_donchian_days=ex,
-                )
-                if df is not None and len(df) >= 2:
-                    cache[(sym, brk, ex)] = df
+                for tp in trend_periods:
+                    for vp in vol_periods:
+                        df = dm.calculate_indicators(
+                            sym,
+                            breakout_lookback=brk,
+                            trend_ma_period=tp,
+                            vol_ma_period=vp,
+                            exit_donchian_days=ex,
+                        )
+                        if df is not None and len(df) >= 2:
+                            cache[(sym, brk, ex, tp, vp)] = df
     dm._current_date = None
     return cache
 
 
-def _brk_exit_sets(grid: List[Dict[str, Any]], baseline_cfg: dict) -> Tuple[Set[int], Set[int]]:
-    brk = {g['breakout_lookback'] for g in grid}
-    ex = {g['exit_donchian_days'] for g in grid}
+def _collect_cache_dims(grid: List[Dict[str, Any]], baseline_cfg: dict) -> Tuple[Set[int], Set[int], Set[int], Set[int]]:
+    btp = int(baseline_cfg['trend_ma_period'])
+    bvp = int(baseline_cfg['vol_ma_period'])
+    brk: Set[int] = set()
+    ex: Set[int] = set()
+    tp: Set[int] = set()
+    vp: Set[int] = set()
+    for g in grid:
+        brk.add(int(g['breakout_lookback']))
+        ex.add(int(g['exit_donchian_days']))
+        tp.add(int(g.get('trend_ma_period', btp)))
+        vp.add(int(g.get('vol_ma_period', bvp)))
     brk.add(int(baseline_cfg['breakout_lookback']))
     ex.add(int(baseline_cfg['exit_donchian_days']))
-    return brk, ex
+    tp.add(btp)
+    vp.add(bvp)
+    return brk, ex, tp, vp
 
 
 def _run_one(
@@ -216,7 +263,7 @@ def _run_one(
     start_bt: date,
     end_date: date,
     cfg: dict,
-    ind_cache: Dict[Tuple[str, int, int], pd.DataFrame] | None = None,
+    ind_cache: Dict[IndCacheKey, pd.DataFrame] | None = None,
 ) -> Dict[str, Any]:
     if ind_cache is not None:
         eng = IndCacheEngine(dm, cfg, ind_cache)
@@ -322,6 +369,65 @@ def _grid_refine_regime_off() -> List[Dict[str, Any]]:
     return rows
 
 
+def _grid_exp_v2() -> List[Dict[str, Any]]:
+    """扩展实验：趋势均线 × 唐奇安出场 × 移动止盈开关；固定量比 1.2、波动目标 15%、关大盘。共 108 组。"""
+    breakouts = [48, 55]
+    stops = [0.08, 0.10, 0.12]
+    exits = [15, 20, 25]
+    trend_ma = [45, 50, 60]
+    trailing_opts: List[Tuple[float, float]] = [(0.0, 0.0), (0.12, 0.09)]
+    rows: List[Dict[str, Any]] = []
+    for b, s, ex, tp, (ta, ts) in itertools.product(
+        breakouts, stops, exits, trend_ma, trailing_opts
+    ):
+        rows.append(
+            {
+                'breakout_lookback': b,
+                'stop_loss_pct': s,
+                'volume_ratio_threshold': 1.2,
+                'use_regime_filter': False,
+                'vol_target_annual': 0.15,
+                'exit_donchian_days': ex,
+                'trend_ma_period': tp,
+                'vol_ma_period': 20,
+                'trailing_activation_pct': ta,
+                'trailing_stop_pct': ts,
+                'use_ma60_loss_exit': True,
+            }
+        )
+    return rows
+
+
+def _grid_exp_v3() -> List[Dict[str, Any]]:
+    """在 v2 思路上加：波动目标、MA60 亏损离场；固定量比 1.2、移动止盈 12%/9%；3×2^5=96 组。"""
+    breakouts = [44, 48, 52]
+    stops = [0.09, 0.11]
+    exits = [18, 22]
+    trend_ma = [48, 55]
+    vtargets = [0.0, 0.15]
+    use_ma60 = [True, False]
+    rows: List[Dict[str, Any]] = []
+    for b, s, ex, tp, vt, m60 in itertools.product(
+        breakouts, stops, exits, trend_ma, vtargets, use_ma60
+    ):
+        rows.append(
+            {
+                'breakout_lookback': b,
+                'stop_loss_pct': s,
+                'volume_ratio_threshold': 1.2,
+                'use_regime_filter': False,
+                'vol_target_annual': vt,
+                'exit_donchian_days': ex,
+                'trend_ma_period': tp,
+                'vol_ma_period': 20,
+                'trailing_activation_pct': 0.12,
+                'trailing_stop_pct': 0.09,
+                'use_ma60_loss_exit': m60,
+            }
+        )
+    return rows
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description='粗粒度参数扫描（夏普）')
     ap.add_argument('--quick', action='store_true', help='3 组冒烟')
@@ -334,6 +440,16 @@ def main() -> None:
         '--refine-regime-off',
         action='store_true',
         help='约 36 组细网格（brk/stop 局部；与 --quick/--full 互斥）',
+    )
+    ap.add_argument(
+        '--exp-v2',
+        action='store_true',
+        help='扩展实验 v2：趋势MA/唐奇安/移动止盈 ×54（与上列模式互斥）',
+    )
+    ap.add_argument(
+        '--exp-v3',
+        action='store_true',
+        help='扩展实验 v3：量比/波动目标/MA60离场 ×96（与上列模式互斥）',
     )
     ap.add_argument(
         '--skip-ipo',
@@ -362,9 +478,9 @@ def main() -> None:
     ap.add_argument('--test-end', type=str, default=None, metavar='YYYY-MM-DD', help='样本外区间终点（覆盖默认 BACKTEST_*）')
     args = ap.parse_args()
 
-    mode_flags = sum(bool(x) for x in (args.quick, args.full, args.refine_regime_off))
+    mode_flags = sum(bool(x) for x in (args.quick, args.full, args.refine_regime_off, args.exp_v2, args.exp_v3))
     if mode_flags > 1:
-        print('请只选其一：--quick / --full / --refine-regime-off', file=sys.stderr)
+        print('请只选其一：--quick / --full / --refine-regime-off / --exp-v2 / --exp-v3', file=sys.stderr)
         sys.exit(2)
 
     skip_ipo = args.skip_ipo or os.getenv('PARAM_SWEEP_SKIP_IPO', '').lower() in ('1', 'true', 'yes')
@@ -375,6 +491,12 @@ def main() -> None:
     elif args.full:
         grid = _grid_full()
         print(f'[扫描] 组合数: {len(grid)}（模式=full）', flush=True)
+    elif args.exp_v2:
+        grid = _grid_exp_v2()
+        print(f'[扫描] 组合数: {len(grid)}（模式=exp-v2 趋势/出场/移动止盈）', flush=True)
+    elif args.exp_v3:
+        grid = _grid_exp_v3()
+        print(f'[扫描] 组合数: {len(grid)}（模式=exp-v3 量比/波动/MA60）', flush=True)
     elif args.quick:
         grid = _grid_quick_smoke()
         print(f'[扫描] 组合数: {len(grid)}（模式=quick 冒烟）', flush=True)
@@ -403,13 +525,19 @@ def main() -> None:
 
     # 基准：当前 backtest.py 顶层默认
     baseline_cfg = bt.engine_config(symbols)
-    brk_set, ex_set = _brk_exit_sets(grid, baseline_cfg)
+    brk_set, ex_set, tp_set, vp_set = _collect_cache_dims(grid, baseline_cfg)
     print(
-        f'[扫描] 预计算指标缓存（突破×唐奇安 = {len(brk_set)}×{len(ex_set)} 档 × {len(symbols)} 只）…',
+        f'[扫描] 预计算指标缓存（突破×唐奇安×趋势MA×量均线 = '
+        f'{len(brk_set)}×{len(ex_set)}×{len(tp_set)}×{len(vp_set)} 档 × {len(symbols)} 只）…',
         flush=True,
     )
-    ind_cache = _precompute_indicators(dm, symbols, brk_set, ex_set, load_end=load_end)
-    print(f'[扫描] 指标缓存条目 {len(ind_cache)}（键: 标的+突破日+唐奇安日）', flush=True)
+    ind_cache = _precompute_indicators(
+        dm, symbols, brk_set, ex_set, tp_set, vp_set, load_end=load_end
+    )
+    print(
+        f'[扫描] 指标缓存条目 {len(ind_cache)}（键: 标的+突破+唐奇安+趋势MA+量均线）',
+        flush=True,
+    )
 
     try:
         base_train = _run_one(dm, blend, symbols, train_start, train_end, baseline_cfg, ind_cache)
@@ -423,18 +551,14 @@ def main() -> None:
     results: List[Dict[str, Any]] = []
     t0 = time.time()
     for i, g in enumerate(grid, start=1):
-        cfg = _make_cfg(
-            symbols,
-            breakout_lookback=g['breakout_lookback'],
-            stop_loss_pct=g['stop_loss_pct'],
-            volume_ratio_threshold=g['volume_ratio_threshold'],
-            use_regime_filter=g['use_regime_filter'],
-            vol_target_annual=g['vol_target_annual'],
-            exit_donchian_days=g['exit_donchian_days'],
-        )
+        cfg = _make_cfg_from_row(symbols, g)
+        ta = g.get('trailing_activation_pct', cfg.get('trailing_activation_pct', 0))
+        ts = g.get('trailing_stop_pct', cfg.get('trailing_stop_pct', 0))
+        tma = g.get('trend_ma_period', cfg.get('trend_ma_period', bt.TREND_MA_PERIOD))
         print(
             f'[扫描] 开始 {i}/{len(grid)} 回测 brk={g["breakout_lookback"]} stop={g["stop_loss_pct"]} '
-            f'vr={g["volume_ratio_threshold"]} reg={g["use_regime_filter"]} vt={g["vol_target_annual"]} …',
+            f'vr={g["volume_ratio_threshold"]} reg={g["use_regime_filter"]} vt={g["vol_target_annual"]} '
+            f'trendMA={tma} trail={ta}/{ts} …',
             flush=True,
         )
         try:
@@ -471,8 +595,8 @@ def main() -> None:
 
     results.sort(key=lambda x: x['sharpe_ratio'], reverse=True)
 
-    # 写 CSV
-    keys = list(results[0].keys())
+    # 写 CSV（合并列名，避免不同网格行键集不一致）
+    keys = list(dict.fromkeys(k for row in results for k in row))
     with open(args.out, 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=keys)
         w.writeheader()
@@ -492,6 +616,12 @@ def main() -> None:
             f"vr={row['volume_ratio_threshold']:.1f} reg={row['use_regime_filter']} "
             f"vt={row['vol_target_annual']:.2f} exit={row['exit_donchian_days']}"
         )
+        if 'trend_ma_period' in row:
+            summ += f" tMA={row['trend_ma_period']}"
+        if row.get('trailing_activation_pct') is not None and row.get('trailing_stop_pct') is not None:
+            summ += f" tr={row['trailing_activation_pct']:.2f}/{row['trailing_stop_pct']:.2f}"
+        if 'use_ma60_loss_exit' in row:
+            summ += f" m60={row['use_ma60_loss_exit']}"
         print(
             f"{i:3d} {row['sharpe_ratio']:8.4f} {row['d_sharpe_vs_baseline']:+9.4f} "
             f"{row['annual_return']:+9.2f} {row['max_drawdown']:8.2f} {row['trade_count']:6d}  {summ}"
@@ -508,11 +638,19 @@ def main() -> None:
         'use_regime_filter',
         'vol_target_annual',
         'exit_donchian_days',
+        'trend_ma_period',
+        'vol_ma_period',
+        'trailing_activation_pct',
+        'trailing_stop_pct',
+        'use_ma60_loss_exit',
     ):
+        if not any(dim in r for r in results):
+            print(f'  {dim}: 当前网格未包含该维度，跳过')
+            continue
         best_val = None
         best_sh = -1e9
-        for val in sorted(set(r[dim] for r in results), key=lambda x: (str(type(x)), x)):
-            sub = [r for r in results if r[dim] == val]
+        for val in sorted(set(r[dim] for r in results if dim in r), key=lambda x: (str(type(x)), x)):
+            sub = [r for r in results if r.get(dim) == val]
             if not sub:
                 continue
             mx = max(sub, key=lambda x: x['sharpe_ratio'])
@@ -523,15 +661,7 @@ def main() -> None:
 
     # 训练期最优参数 → 测试期样本外
     best_row = results[0]
-    best_cfg = _make_cfg(
-        symbols,
-        breakout_lookback=best_row['breakout_lookback'],
-        stop_loss_pct=best_row['stop_loss_pct'],
-        volume_ratio_threshold=best_row['volume_ratio_threshold'],
-        use_regime_filter=best_row['use_regime_filter'],
-        vol_target_annual=best_row['vol_target_annual'],
-        exit_donchian_days=best_row['exit_donchian_days'],
-    )
+    best_cfg = _make_cfg_from_row(symbols, best_row)
     try:
         oos = _run_one(dm, blend, symbols, test_start, test_end, best_cfg, ind_cache)
         base_test = _run_one(dm, blend, symbols, test_start, test_end, baseline_cfg, ind_cache)
@@ -547,11 +677,18 @@ def main() -> None:
     print('\n' + '=' * 72)
     print('样本外（测试期）：训练夏普最优的一组参数')
     print('=' * 72)
+    extra = ''
+    if 'trend_ma_period' in best_row:
+        extra += f" trendMA={best_row['trend_ma_period']}"
+    if best_row.get('trailing_activation_pct') is not None and best_row.get('trailing_stop_pct') is not None:
+        extra += f" trail={best_row['trailing_activation_pct']:.2f}/{best_row['trailing_stop_pct']:.2f}"
+    if 'use_ma60_loss_exit' in best_row:
+        extra += f" ma60exit={best_row['use_ma60_loss_exit']}"
     print(
         f"  训练期最优 Sharpe: {best_row['sharpe_ratio']:.4f}  "
         f"brk={best_row['breakout_lookback']} stop={best_row['stop_loss_pct']:.4f} "
         f"vr={best_row['volume_ratio_threshold']:.2f} reg={best_row['use_regime_filter']} "
-        f"vt={best_row['vol_target_annual']:.2f} exit={best_row['exit_donchian_days']}"
+        f"vt={best_row['vol_target_annual']:.2f} exit={best_row['exit_donchian_days']}{extra}"
     )
     print(f'  测试期 {test_start} ~ {test_end} 同参数 Sharpe: {oos_sh:.4f}')
     if oos:
@@ -584,8 +721,13 @@ def main() -> None:
         'use_regime_filter',
         'vol_target_annual',
         'exit_donchian_days',
+        'trend_ma_period',
+        'vol_ma_period',
+        'trailing_activation_pct',
+        'trailing_stop_pct',
+        'use_ma60_loss_exit',
     ):
-        oos_row[f'best_{k}'] = best_row[k]
+        oos_row[f'best_{k}'] = best_row[k] if k in best_row else ''
     with open(oos_path, 'w', newline='', encoding='utf-8') as f:
         w = csv.DictWriter(f, fieldnames=list(oos_row.keys()))
         w.writeheader()
