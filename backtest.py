@@ -71,6 +71,10 @@ INITIAL_CAPITAL = 100_000.0
 MAX_POSITIONS = 10
 POSITION_SIZE_PCT = 0.20  # 单笔目标占当时总权益比例（会再乘以下波动缩放）
 
+# 最后一个交易日收盘前强制清仓（买卖笔数成对）；环境变量 BACKTEST_CLOSE_ALL_LAST_DAY=0 可关闭
+_BACKTEST_CLOSE_LAST = os.environ.get('BACKTEST_CLOSE_ALL_LAST_DAY', '').strip().lower()
+CLOSE_ALL_POSITIONS_LAST_DAY = _BACKTEST_CLOSE_LAST not in ('0', 'false', 'no', 'off')
+
 # —— 策略参数（若存在 trained_strategy_params.json 则由训练覆盖；否则用此处默认）——
 STOP_LOSS_PCT = 0.10
 BREAKOUT_LOOKBACK = 40
@@ -340,6 +344,7 @@ class DualBreakoutEngine:
         self.trades: List[dict] = []
         self.daily_values: List = []
         self._verbose = True
+        self.close_all_last_day = bool(self.config.get('close_all_last_day', True))
 
     def _min_buy_notional(self, symbol: str) -> float:
         return 800.0 if symbol.endswith('.US') else 5000.0
@@ -418,6 +423,7 @@ class DualBreakoutEngine:
 
         all_dates = self.dm.get_all_trading_dates()
         trading_dates = [d for d in all_dates if start_date <= d <= end_date]
+        last_i = len(trading_dates) - 1 if trading_dates else -1
 
         if verbose:
             print('\n' + '=' * 60)
@@ -452,9 +458,30 @@ class DualBreakoutEngine:
             self._check_sell_signals(current_date)
             pool = self.dm.get_tradable_pool(symbols_subset=self.symbols_subset)
             self._check_buy_signals(current_date, pool)
+            if self.close_all_last_day and i == last_i and self.positions:
+                npos = len(self.positions)
+                if self._verbose:
+                    print(
+                        f'[回测] 最后交易日 {current_date}：期末强制平仓 {npos} 只（按昨收）',
+                        flush=True,
+                    )
+                self._liquidate_all_at_backtest_end(current_date, '回测期末平仓')
             self.daily_values.append((str(current_date), self.total_value))
 
         return self._generate_report(benchmark_data, verbose, compare_indices)
+
+    def _liquidate_all_at_backtest_end(self, current_date: date, reason: str) -> None:
+        """回测区间末日：按当日信号用的收盘价卖出全部持仓。"""
+        for symbol in list(self.positions.keys()):
+            df = self._ind(symbol)
+            if df is not None and len(df) >= 1:
+                price = float(df.iloc[-1]['close'])
+            else:
+                px = self.dm.get_latest_price(symbol)
+                if px is None:
+                    continue
+                price = float(px)
+            self._execute_sell(current_date, symbol, price, 1.0, reason)
 
     def _update_positions(self) -> None:
         for sym in list(self.positions.keys()):
@@ -1108,6 +1135,7 @@ def engine_config(symbols: List[str]) -> dict:
         'vol_scale_max': VOL_SCALE_MAX,
         'trailing_activation_pct': TRAILING_ACTIVATION_PCT,
         'trailing_stop_pct': TRAILING_STOP_PCT,
+        'close_all_last_day': CLOSE_ALL_POSITIONS_LAST_DAY,
         'symbols_subset': set(symbols),
     }
     ov = load_trained_strategy_param_overrides()
