@@ -387,6 +387,58 @@ def get_api_singleton() -> 'HKStockAPI':
     return _get_api_singleton()
 
 
+def _static_info_display_name(info) -> str:
+    """从 Longport SecuStaticInfo 取可读简称（优先中文）。"""
+    for attr in (
+        'name_cn',
+        'name_cn_long',
+        'name_cn_short',
+        'stock_name',
+        'name',
+    ):
+        v = getattr(info, attr, None)
+        if v is not None:
+            s = str(v).strip()
+            if s and s.lower() != 'nan':
+                return s
+    return ''
+
+
+def fetch_static_display_names(symbols: List[str]) -> Dict[str, str]:
+    """
+    批量查询证券简称（static_info），用于 CSV 无中文名时的补全。
+    每批最多约 500 个 symbol；失败返回空 dict。
+    """
+    out: Dict[str, str] = {}
+    if not symbols:
+        return out
+    uniq = list(dict.fromkeys(s for s in symbols if s))
+    api = _get_api_singleton()
+    batch = 500
+    for i in range(0, len(uniq), batch):
+        chunk = uniq[i : i + batch]
+        try:
+            resp = api._call_with_retry(api.quote_ctx.static_info, chunk)
+        except Exception:
+            continue
+        infos: List = []
+        if resp is None:
+            pass
+        elif hasattr(resp, 'secu_static_info'):
+            infos = list(resp.secu_static_info)
+        elif isinstance(resp, (list, tuple)):
+            infos = list(resp)
+        for info in infos:
+            sym = getattr(info, 'symbol', None)
+            if not sym:
+                continue
+            name = _static_info_display_name(info)
+            if name and sym not in out:
+                out[str(sym)] = name
+        time.sleep(float(os.getenv('LONGPORT_REQUEST_PAUSE', '0.15')))
+    return out
+
+
 def fetch_daily_bars(
     symbol: str,
     start_date: date,

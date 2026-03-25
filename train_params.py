@@ -14,7 +14,6 @@
   python train_params.py --exp-v3         # 扩展网格：波动目标×MA60 离场（96 组）
   python train_params.py --full           # 约 48 组粗网格（可选）
   python train_params.py --refine-regime-off   # 约 36 组细网格（可选）
-  python train_params.py --skip-ipo       # 构建候选池时不扫新股
   python train_params.py --no-save-strategy-json   # 不写 JSON
   python train_params.py --train-start 2024-01-01 --train-end 2025-12-31 \\
       --test-start 2022-01-01 --test-end 2023-12-31 --out-strategy-json exp.json
@@ -42,7 +41,7 @@ import pandas as pd
 
 # 复用 backtest 的配置与引擎
 import backtest as bt
-from hk_universe import build_hsi_hstech_ipo_universe
+from hk_universe import build_hsi_hstech_universe
 
 # 训练期（仅本脚本；2023 年及以前日线用于拟合参数）
 TRAIN_START = date(2020, 1, 1)
@@ -97,19 +96,15 @@ def _save_trained_strategy_json(
         json.dump(payload, f, ensure_ascii=False, indent=2)
 
 
-def _build_symbols(skip_ipo: bool) -> List[str]:
-    if bt.UNIVERSE_MODE != 'hsi_hstech_ipo':
-        print('train_params 当前仅针对 UNIVERSE_MODE=hsi_hstech_ipo，请在 backtest.py 中设置', file=sys.stderr)
+def _build_symbols() -> List[str]:
+    if bt.UNIVERSE_MODE != 'hsi_hstech':
+        print('train_params 当前仅针对 UNIVERSE_MODE=hsi_hstech，请在 backtest.py 中设置', file=sys.stderr)
         sys.exit(1)
-    include_ipo = bt.INCLUDE_IPO_UNIVERSE and not skip_ipo
-    symbols, _ = build_hsi_hstech_ipo_universe(
+    symbols, _ = build_hsi_hstech_universe(
         hsi_csv=bt.HSI_CONSTITUENTS_CSV,
         hstech_csv=bt.HSTECH_CONSTITUENTS_CSV,
         hsi_example=bt.HSI_CONSTITUENTS_EXAMPLE,
         hstech_example=bt.HSTECH_CONSTITUENTS_EXAMPLE,
-        hk_all_csv=bt.HK_ALL_STOCKS_CSV,
-        include_ipo=include_ipo,
-        ipo_max_age_days=bt.IPO_LISTING_MAX_AGE_DAYS,
     )
     if not symbols:
         sys.exit('候选池为空')
@@ -452,11 +447,6 @@ def main() -> None:
         help='扩展实验 v3：量比/波动目标/MA60离场 ×96（与上列模式互斥）',
     )
     ap.add_argument(
-        '--skip-ipo',
-        action='store_true',
-        help='构建候选池时不扫描新股（与 backtest 中 INCLUDE_IPO_UNIVERSE=False 等效）',
-    )
-    ap.add_argument(
         '--out',
         default='param_sweep_results.csv',
         help='训练期网格结果 CSV 路径',
@@ -483,8 +473,6 @@ def main() -> None:
         print('请只选其一：--quick / --full / --refine-regime-off / --exp-v2 / --exp-v3', file=sys.stderr)
         sys.exit(2)
 
-    skip_ipo = args.skip_ipo or os.getenv('PARAM_SWEEP_SKIP_IPO', '').lower() in ('1', 'true', 'yes')
-
     if args.refine_regime_off:
         grid = _grid_refine_regime_off()
         print(f'[扫描] 组合数: {len(grid)}（模式=refine-regime-off）', flush=True)
@@ -504,7 +492,7 @@ def main() -> None:
         grid = _grid_default_train()
         print(f'[扫描] 组合数: {len(grid)}（模式=default 训练 10 组）', flush=True)
 
-    symbols = _build_symbols(skip_ipo=skip_ipo)
+    symbols = _build_symbols()
     print(f'[扫描] 候选池 {len(symbols)} 只', flush=True)
 
     def _pd(s: str | None, default: date) -> date:

@@ -19,6 +19,14 @@ from typing import Any, Dict, List, Optional, Set, Union
 import numpy as np
 import pandas as pd
 
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
+
 # =============================================================================
 # 用户配置（修改此处即可）
 # =============================================================================
@@ -43,8 +51,8 @@ UNIVERSE_CSV = ""
 
 # 候选池来源：
 # - "csv"：仅使用 UNIVERSE_CSV 中的标的（或默认 example）
-# - "hsi_hstech_ipo"：恒指成分 ∪ 恒生科技成分（见下方 CSV）∪ 可选「近一年上市」新股（扫 hk_all + static_info）
-UNIVERSE_MODE = 'hsi_hstech_ipo'
+# - "hsi_hstech"：恒指成分 ∪ 恒生科技成分（仅下方成分 CSV）
+UNIVERSE_MODE = 'hsi_hstech'
 
 # 恒指 / 恒生科技成分表（正式文件优先；若无则用 *.example.csv 样例，请定期从恒生指数官网更新）
 HSI_CONSTITUENTS_CSV = 'data/hsi_constituents.csv'
@@ -52,13 +60,8 @@ HSTECH_CONSTITUENTS_CSV = 'data/hstech_constituents.csv'
 HSI_CONSTITUENTS_EXAMPLE = 'data/hsi_constituents.example.csv'
 HSTECH_CONSTITUENTS_EXAMPLE = 'data/hstech_constituents.example.csv'
 
-# 新股池：对 HK_ALL_STOCKS_CSV 中全部代码请求 static_info，listing_date 在下列天数内则纳入
-HK_ALL_STOCKS_CSV = 'hk_all_stocks.csv'
-INCLUDE_IPO_UNIVERSE = True
-IPO_LISTING_MAX_AGE_DAYS = 365
-
-# 仅当 UNIVERSE_MODE = 'hk_all' 时生效
-HK_ALL_MAX = 200
+# 可选：含「代码」「中文名称」列的 CSV，仅用于成交明细展示；不设则依赖 Longport 补全（见 enrich_cn_map_for_trades）
+HK_CN_NAMES_CSV = os.environ.get('HK_CN_NAMES_CSV', '').strip()
 
 # 回测起点再往前多取的自然日（用于指标预热；REGIME_MA_DAYS=200 时建议 ≥400）
 DATA_WARMUP_DAYS_BEFORE_START = 400
@@ -122,6 +125,7 @@ class HistoricalDataManager:
         from daily_cache import normalize_df_index
         from hk_stock_api import fetch_daily_bars
 
+        verbose_daily = os.getenv('TREND_VERBOSE_DAILY_LOG', '').lower() in ('1', 'true', 'yes')
         loaded = 0
         pause = float(os.getenv('LONGPORT_REQUEST_PAUSE', '0.15'))
         for i, symbol in enumerate(symbols):
@@ -130,8 +134,8 @@ class HistoricalDataManager:
                     symbol,
                     start_date,
                     end_date,
-                    log_cache=True,
-                    progress=(i + 1, len(symbols)),
+                    log_cache=verbose_daily,
+                    progress=(i + 1, len(symbols)) if verbose_daily else None,
                 )
                 if df is not None and len(df) > 0:
                     df = normalize_df_index(df)
@@ -143,7 +147,14 @@ class HistoricalDataManager:
             finally:
                 if pause > 0 and i + 1 < len(symbols):
                     time.sleep(pause)
-        print(f'\n成功加载: {loaded}/{len(symbols)} 只股票')
+        if not verbose_daily:
+            print(
+                f'[日线] 批量加载完成: {loaded}/{len(symbols)} 只有效（{start_date}～{end_date}）；'
+                f'单笔拉取日志已关闭，需要时设 TREND_VERBOSE_DAILY_LOG=1',
+                flush=True,
+            )
+        else:
+            print(f'\n成功加载: {loaded}/{len(symbols)} 只股票')
         if loaded == 0:
             print(
                 '[提示] 若缓存 CSV 为旧版本导致切片为空，可删除 data_cache/daily/ 后重跑，'
@@ -571,6 +582,13 @@ class DualBreakoutEngine:
                 'reason': reason,
             }
         )
+        nav = self.total_value
+        mv = float(shares) * float(price)
+        wp = 100.0 * mv / nav if nav > 0 else 0.0
+        self.trades[-1]['weight_pct'] = wp
+        self.trades[-1]['nav'] = nav
+        self.trades[-1]['pnl_amount'] = None
+        self.trades[-1]['realized_pnl_pct'] = None
 
     def _execute_sell(self, current_date: date, symbol: str, price: float, ratio: float, reason: str) -> None:
         if symbol not in self.positions:
@@ -580,8 +598,16 @@ class DualBreakoutEngine:
         if sell_shares <= 0:
             return
         fee = self.one_way_cost_rate
+        nav_before = self.total_value
+        sell_mv = float(sell_shares) * float(price)
+        sw = 100.0 * sell_mv / nav_before if nav_before > 0 else 0.0
         self.cash += sell_shares * price * (1.0 - fee)
         pnl_pct = (price / pos['buy_price'] - 1.0) * 100
+        buy_px = float(pos['buy_price'])
+        buy_cost = float(sell_shares) * buy_px * (1.0 + fee)
+        sell_proceeds = float(sell_shares) * float(price) * (1.0 - fee)
+        pnl_amt = sell_proceeds - buy_cost
+        rpct = 100.0 * pnl_amt / buy_cost if buy_cost > 0 else 0.0
         self.trades.append(
             {
                 'date': str(current_date),
@@ -589,7 +615,11 @@ class DualBreakoutEngine:
                 'symbol': symbol,
                 'price': price,
                 'shares': sell_shares,
-                'reason': f'{reason}, 盈亏:{pnl_pct:+.1f}%',
+                'reason': f'{reason}, 价差盈亏:{pnl_pct:+.1f}%',
+                'weight_pct': sw,
+                'nav': nav_before,
+                'pnl_amount': pnl_amt,
+                'realized_pnl_pct': rpct,
             }
         )
         pos['shares'] -= sell_shares
@@ -721,6 +751,11 @@ class DualBreakoutEngine:
                             f'恒指跌得更多时，同一策略收益下「相对恒指超额」往往高于「相对科技超额」。'
                         )
             print(f'\n【交易】买入{len(buys)} 卖出{len(sells)}  期末持仓{len(self.positions)}只')
+            if self.trades:
+                cmap = load_hk_cn_name_map(HK_CN_NAMES_CSV)
+                cmap = enrich_cn_map_for_trades(cmap, self.trades)
+                print_trades_with_names(self.trades, cmap, self.config)
+                self._trade_print_done = True
 
         idx_returns: Dict[str, float] = {}
         if compare_indices and self.daily_values:
@@ -756,7 +791,7 @@ def load_us_etf(symbol: str, start_date: date, end_date: date) -> Optional[pd.Da
     from hk_stock_api import fetch_daily_bars
 
     pause = float(os.getenv('LONGPORT_REQUEST_PAUSE', '0.15'))
-    df = fetch_daily_bars(symbol, start_date, end_date, log_cache=True)
+    df = fetch_daily_bars(symbol, start_date, end_date, log_cache=False)
     time.sleep(pause)
     return df if df is not None and len(df) > 0 else None
 
@@ -784,7 +819,7 @@ def load_hstech_data(start_date: date, end_date: date) -> Optional[pd.DataFrame]
     pause = float(os.getenv('LONGPORT_REQUEST_PAUSE', '0.15'))
     for sym in ('HSTECH.HK', '03067.HK'):
         try:
-            df = fetch_daily_bars(sym, start_date, end_date, log_cache=True)
+            df = fetch_daily_bars(sym, start_date, end_date, log_cache=False)
             time.sleep(pause)
             if df is not None and len(df) > 0:
                 print(f'[回测] 恒生科技基准: {sym}，{len(df)} 条', flush=True)
@@ -820,21 +855,20 @@ def build_blended_benchmark(hsi: Optional[pd.DataFrame], spy: Optional[pd.DataFr
 def load_hsi_data(start_date: date, end_date: date) -> Optional[pd.DataFrame]:
     from hk_stock_api import fetch_daily_bars
 
-    print('\n加载恒生指数数据...')
     try:
-        df = fetch_daily_bars('HSI.HK', start_date, end_date, log_cache=True)
+        df = fetch_daily_bars('HSI.HK', start_date, end_date, log_cache=False)
         if df is not None and len(df) > 0:
-            print(f'恒生指数: {len(df)} 条数据')
+            print(f'[回测] 恒生指数 HSI.HK: {len(df)} 条', flush=True)
             return df
     except Exception as e:
-        print(f'加载恒生指数失败: {e}')
+        print(f'[回测] 加载 HSI.HK 失败: {e}', flush=True)
     try:
-        df = fetch_daily_bars('02800.HK', start_date, end_date, log_cache=True)
+        df = fetch_daily_bars('02800.HK', start_date, end_date, log_cache=False)
         if df is not None and len(df) > 0:
-            print(f'使用盈富基金(02800.HK)作为基准: {len(df)} 条数据')
+            print(f'[回测] 恒生基准改用盈富 02800.HK: {len(df)} 条', flush=True)
             return df
     except Exception as e:
-        print(f'加载盈富基金失败: {e}')
+        print(f'[回测] 加载 02800.HK 失败: {e}', flush=True)
     return None
 
 
@@ -853,20 +887,35 @@ def load_universe_csv(path: str) -> List[str]:
     return list(dict.fromkeys(out))
 
 
-def load_hk_all_symbol_list(path: str, max_n: int) -> List[str]:
-    """从港股全表 CSV（含「代码」列）取前 max_n 个 .HK 代码。"""
-    if not os.path.exists(path):
-        return []
-    df = pd.read_csv(path)
-    if '代码' not in df.columns:
-        return []
-    codes = df['代码'].astype(str).str.replace(r'\.0$', '', regex=True).str.zfill(5)
-    syms = [f'{c}.HK' for c in codes.unique()]
-    return syms[: max(0, max_n)]
+def enrich_cn_map_for_trades(
+    base: Dict[str, str],
+    trades: List[Dict[str, Any]],
+) -> Dict[str, str]:
+    """
+    为成交里的代码补充中文简称：优先 HK_CN_NAMES_CSV（若配置）；缺省用 Longport static_info（需凭证）。
+    设 TREND_RESOLVE_NAMES=0 可关闭 API 补全。
+    """
+    syms = list(dict.fromkeys(str(t.get('symbol', '')) for t in trades if t.get('symbol')))
+    miss = [s for s in syms if s and not (base.get(s) or '').strip()]
+    if not miss:
+        return base
+    if os.getenv('TREND_RESOLVE_NAMES', '1').lower() in ('0', 'false', 'no'):
+        return base
+    try:
+        from hk_stock_api import fetch_static_display_names
+
+        extra = fetch_static_display_names(miss)
+    except Exception:
+        return base
+    out = dict(base)
+    for k, v in extra.items():
+        if v and k not in out:
+            out[k] = v
+    return out
 
 
 def load_hk_cn_name_map(path: str) -> Dict[str, str]:
-    """港股代码 -> 中文名称（来自 hk_all_stocks.csv「代码」「中文名称」列）。"""
+    """港股代码 -> 中文名称（CSV 需含「代码」「中文名称」列；path 为空或不存在则返回空）。"""
     if not path or not os.path.exists(path):
         return {}
     try:
@@ -890,41 +939,58 @@ def load_hk_cn_name_map(path: str) -> Dict[str, str]:
     return out
 
 
-def _fmt_trade_lines(
-    trades: List[Dict[str, Any]],
-    cn_map: Dict[str, str],
-    *,
-    position_size_pct: float,
-    max_positions: int,
-) -> List[str]:
-    """控制台用：多行文本。"""
+def _sort_trades_for_display(trades: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """按标的代码聚合：同代码内按日期、买卖顺序排列。"""
+    ord_act = {'BUY': 0, 'SELL': 1}
+    return sorted(
+        trades,
+        key=lambda t: (
+            str(t.get('symbol', '')),
+            str(t.get('date', '')),
+            ord_act.get(str(t.get('action', '')), 9),
+        ),
+    )
+
+
+def _trade_label_name(sym: str, cn_map: Dict[str, str]) -> str:
+    """控制台「名称」列：中文名 + 代码，便于辨认。"""
+    cn = (cn_map.get(sym, '') or '').strip()
+    if cn:
+        return f'{cn} ({sym})'
+    return sym
+
+
+def _fmt_trade_lines(trades: List[Dict[str, Any]], cn_map: Dict[str, str]) -> List[str]:
+    """控制台用：仅名称、时间、方向、总金额、盈亏（按代码排序）。"""
+    ordered = _sort_trades_for_display(trades)
     lines: List[str] = []
+    w = 110
     lines.append('')
-    lines.append('=' * 120)
-    lines.append('【成交明细】')
-    lines.append(
-        f'  仓位规则：单标的买入额 ≈ min(现金×0.92, 当日总净值×{position_size_pct:.0%}×波动缩放)；'
-        f'最多同时 {max_positions} 只。下列「成交金额」为 股数×成交价（未含双边费用）。'
-    )
-    lines.append(
-        f'  {"#":>4} {"日期":12} {"方向":4} {"代码":12} {"中文名":12} {"股数":>8} {"价":>10} {"成交金额":>14}  备注'
-    )
-    lines.append('-' * 120)
-    for i, t in enumerate(trades, start=1):
+    lines.append('=' * w)
+    lines.append('【成交明细】按代码分组；卖出盈亏为费后实现额，括号内为相对买入成本%')
+    lines.append(f'  {"#":>4}  {"名称":40} {"交易日":12} {"方向":6} {"总金额":>14} {"盈亏":>18}')
+    lines.append('-' * w)
+    for i, t in enumerate(ordered, start=1):
         sym = str(t.get('symbol', ''))
-        cn = (cn_map.get(sym, '') or '—')[:12]
+        label = _trade_label_name(sym, cn_map)
+        if len(label) > 40:
+            label = label[:37] + '...'
         sh = int(t.get('shares', 0))
         px = float(t.get('price', 0.0))
         amt = sh * px
         act = str(t.get('action', ''))
         dt = str(t.get('date', ''))
-        reason = str(t.get('reason', '')).replace('\n', ' ')
-        if len(reason) > 60:
-            reason = reason[:57] + '...'
+        side = '买入' if act == 'BUY' else '卖出' if act == 'SELL' else act
+        pamt = t.get('pnl_amount')
+        rp = t.get('realized_pnl_pct')
+        if pamt is not None and rp is not None:
+            pnl_s = f'{float(pamt):+,.2f} ({float(rp):+.2f}%)'
+        else:
+            pnl_s = '—'
         lines.append(
-            f'  {i:4d} {dt:12} {act:4} {sym:12} {cn:12} {sh:8d} {px:10.4f} {amt:14,.2f}  {reason}'
+            f'  {i:4d}  {label:40} {dt:12} {side:6} {amt:14,.2f} {pnl_s:>18}'
         )
-    lines.append('=' * 120)
+    lines.append('=' * w)
     return lines
 
 
@@ -933,12 +999,11 @@ def print_trades_with_names(
     cn_map: Dict[str, str],
     config: Dict[str, Any],
 ) -> None:
+    _ = config  # 保留参数以兼容调用方
     if not trades:
         print('\n【成交明细】本区间无成交记录。')
         return
-    ps = float(config.get('position_size_pct', 0.1))
-    mx = int(config.get('max_positions', 10))
-    for line in _fmt_trade_lines(trades, cn_map, position_size_pct=ps, max_positions=mx):
+    for line in _fmt_trade_lines(trades, cn_map):
         print(line, flush=True)
 
 
@@ -947,40 +1012,44 @@ def write_trades_csv(
     cn_map: Dict[str, str],
     path: str,
 ) -> None:
-    """成交明细 CSV：含中文名、股数、价、名义成交金额、完整备注。"""
+    """成交明细 CSV：与控制台一致的精简列（按代码排序）。"""
     import csv as _csv
 
+    ordered = _sort_trades_for_display(trades)
     with open(path, 'w', newline='', encoding='utf-8-sig') as f:
         w = _csv.writer(f)
         w.writerow(
             [
                 '序号',
-                '日期',
-                '方向',
+                '名称_显示',
                 '代码',
-                '中文名称',
-                '股数',
-                '成交价',
-                '成交金额_股数x价',
-                '备注',
+                '交易日',
+                '方向',
+                '总金额_股数x价',
+                '盈亏_费后',
+                '盈亏_pct_相对成本',
             ]
         )
-        for i, t in enumerate(trades, start=1):
+        for i, t in enumerate(ordered, start=1):
             sym = str(t.get('symbol', ''))
-            cn = cn_map.get(sym, '') or ''
+            label = _trade_label_name(sym, cn_map)
             sh = int(t.get('shares', 0))
             px = float(t.get('price', 0.0))
+            amt = sh * px
+            act = str(t.get('action', ''))
+            side = '买入' if act == 'BUY' else '卖出' if act == 'SELL' else act
+            pamt = t.get('pnl_amount')
+            rp = t.get('realized_pnl_pct')
             w.writerow(
                 [
                     i,
-                    t.get('date', ''),
-                    t.get('action', ''),
+                    label,
                     sym,
-                    cn,
-                    sh,
-                    f'{px:.6f}',
-                    f'{sh * px:.2f}',
-                    t.get('reason', ''),
+                    t.get('date', ''),
+                    side,
+                    f'{amt:.2f}',
+                    f'{float(pamt):.4f}' if pamt is not None else '',
+                    f'{float(rp):.4f}' if rp is not None else '',
                 ]
             )
 
@@ -991,8 +1060,8 @@ def maybe_emit_trade_log(eng: 'DualBreakoutEngine', config: Dict[str, Any]) -> N
     csv_path = (os.environ.get('BACKTEST_TRADES_CSV') or '').strip()
     if not want_print and not csv_path:
         return
-    cmap = load_hk_cn_name_map(HK_ALL_STOCKS_CSV)
-    if want_print:
+    cmap = enrich_cn_map_for_trades(load_hk_cn_name_map(HK_CN_NAMES_CSV), eng.trades)
+    if want_print and not getattr(eng, '_trade_print_done', False):
         print_trades_with_names(eng.trades, cmap, config)
     if csv_path:
         write_trades_csv(eng.trades, cmap, csv_path)
@@ -1055,32 +1124,22 @@ def main() -> None:
     start_bt = BACKTEST_START
     data_start = start_bt - timedelta(days=DATA_WARMUP_DAYS_BEFORE_START)
 
-    if UNIVERSE_MODE == 'hsi_hstech_ipo':
-        from hk_universe import build_hsi_hstech_ipo_universe
+    if UNIVERSE_MODE == 'hsi_hstech':
+        from hk_universe import build_hsi_hstech_universe
 
         try:
-            symbols, _desc = build_hsi_hstech_ipo_universe(
+            symbols, _desc = build_hsi_hstech_universe(
                 hsi_csv=HSI_CONSTITUENTS_CSV,
                 hstech_csv=HSTECH_CONSTITUENTS_CSV,
                 hsi_example=HSI_CONSTITUENTS_EXAMPLE,
                 hstech_example=HSTECH_CONSTITUENTS_EXAMPLE,
-                hk_all_csv=HK_ALL_STOCKS_CSV,
-                include_ipo=INCLUDE_IPO_UNIVERSE,
-                ipo_max_age_days=IPO_LISTING_MAX_AGE_DAYS,
             )
         except FileNotFoundError as e:
             print(str(e), file=sys.stderr)
             sys.exit(1)
         if not symbols:
-            print('候选池为空：请检查成分 CSV 与新股开关', file=sys.stderr)
+            print('候选池为空：请检查恒指/恒生科技成分 CSV', file=sys.stderr)
             sys.exit(1)
-    elif UNIVERSE_MODE == 'hk_all':
-        symbols = load_hk_all_symbol_list(HK_ALL_STOCKS_CSV, HK_ALL_MAX)
-        uni = HK_ALL_STOCKS_CSV
-        if not symbols:
-            print(f'未从 {HK_ALL_STOCKS_CSV} 读到代码列「代码」，或文件不存在', file=sys.stderr)
-            sys.exit(1)
-        print(f'候选池: hk_all 模式，{uni} 前 {len(symbols)} 只港股', flush=True)
     else:
         uni = UNIVERSE_CSV.strip()
         if not uni:
