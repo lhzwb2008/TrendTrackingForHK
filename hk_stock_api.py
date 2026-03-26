@@ -47,6 +47,22 @@ def _candle_ts_to_date(ts) -> date:
     return datetime.fromtimestamp(ts).date()
 
 
+def _hourly_fetch_start_date(requested: date) -> date:
+    """Longport 分钟/60m K 有历史起点限制（常见错误码 301600）；过早起始会整段失败。
+    默认不低于 2024-04-01，可用环境变量 TREND_HOURLY_MIN_DATE=YYYY-MM-DD 覆盖。"""
+    raw = os.getenv('TREND_HOURLY_MIN_DATE', '2024-04-01').strip()
+    try:
+        floor = date.fromisoformat(raw)
+    except ValueError:
+        floor = date(2024, 4, 1)
+    return max(requested, floor)
+
+
+def _is_minute_kline_begin_date_error(exc: BaseException) -> bool:
+    s = str(exc).lower()
+    return '301600' in str(exc) or 'minute kline begin' in s or 'out of minute' in s
+
+
 def _index_to_date(idx_min) -> date:
     """索引元素转 date（兼容 Timestamp / date）。"""
     if isinstance(idx_min, datetime):
@@ -195,6 +211,84 @@ class HKStockAPI:
 
         except Exception as e:
             logger.error(f'{symbol}: 获取日线数据失败 - {e}')
+            return pd.DataFrame()
+
+    def _fetch_hourly_range(
+        self,
+        symbol: str,
+        start_date: date,
+        end_date: date,
+        adjust: AdjustType = AdjustType.ForwardAdjust,
+    ) -> pd.DataFrame:
+        """拉取 [start_date, end_date] 内 60 分钟 K（Period.Min_60），索引为 datetime。
+
+        Longport 单次 history 条数有上限（约千根），必须按日历窗口分批请求再合并，
+        否则长区间只会得到「最近一段」60m，导致训练期无小时数据、入场全被过滤。
+        """
+        try:
+            start_date = _hourly_fetch_start_date(start_date)
+            if start_date > end_date:
+                return pd.DataFrame()
+            batch_days = max(5, int(os.getenv('LONGPORT_HOURLY_BATCH_DAYS', '25')))
+            pause = float(os.getenv('LONGPORT_REQUEST_PAUSE', '0.12'))
+            all_rows: List[dict] = []
+            cur = start_date
+            while cur <= end_date:
+                batch_end = min(cur + timedelta(days=batch_days - 1), end_date)
+                try:
+                    candles = self._call_with_retry(
+                        self.quote_ctx.history_candlesticks_by_date,
+                        symbol,
+                        Period.Min_60,
+                        adjust,
+                        cur,
+                        batch_end,
+                    )
+                except Exception as e:
+                    if _is_minute_kline_begin_date_error(e):
+                        logger.warning(
+                            '%s: 60m 批次 %s~%s 超出 API 分钟K线起始范围，跳过: %s',
+                            symbol,
+                            cur,
+                            batch_end,
+                            e,
+                        )
+                        cur = batch_end + timedelta(days=1)
+                        continue
+                    raise
+                if candles:
+                    for c in candles:
+                        ts = c.timestamp
+                        if isinstance(ts, datetime):
+                            dt = ts
+                        elif isinstance(ts, date):
+                            dt = datetime.combine(ts, datetime.min.time())
+                        else:
+                            dt = datetime.fromtimestamp(float(ts))
+                        all_rows.append(
+                            {
+                                'datetime': dt,
+                                'open': float(c.open),
+                                'high': float(c.high),
+                                'low': float(c.low),
+                                'close': float(c.close),
+                                'volume': int(c.volume),
+                                'turnover': float(c.turnover),
+                            }
+                        )
+                cur = batch_end + timedelta(days=1)
+                if pause > 0 and cur <= end_date:
+                    time.sleep(pause)
+
+            if not all_rows:
+                return pd.DataFrame()
+            df = pd.DataFrame(all_rows).set_index('datetime').sort_index()
+            df = df[~df.index.duplicated(keep='first')]
+            from daily_cache import normalize_df_index
+
+            return normalize_df_index(df)
+        except Exception as e:
+            logger.error(f'{symbol}: 获取60m K线失败 - {e}')
             return pd.DataFrame()
 
     def get_daily_data(
@@ -471,6 +565,55 @@ def fetch_daily_bars(
         return normalize_df_index(raw)
 
     df, _msg = merge_daily_cache(
+        symbol,
+        start_date,
+        end_date,
+        fetch_range,
+        log_cache=log_cache,
+        progress=progress,
+    )
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+    return normalize_df_index(df)
+
+
+def fetch_hourly_bars(
+    symbol: str,
+    start_date: date,
+    end_date: date,
+    adjust: AdjustType = AdjustType.ForwardAdjust,
+    log_cache: bool = True,
+    progress: Optional[Tuple[int, int]] = None,
+) -> pd.DataFrame:
+    """
+    拉取 60 分钟 K（Longport Min_60），带 data_cache/hourly_60/ CSV 缓存。
+    """
+    from daily_cache import normalize_df_index
+    from hourly_cache import merge_hourly_cache
+
+    start_date = _hourly_fetch_start_date(start_date)
+    if start_date > end_date:
+        return pd.DataFrame()
+
+    if os.getenv('TREND_DISABLE_HOURLY_CACHE', '').lower() in ('1', 'true', 'yes'):
+        df = _get_api_singleton()._fetch_hourly_range(symbol, start_date, end_date, adjust)
+        if df is None or len(df) == 0:
+            return pd.DataFrame()
+        df = normalize_df_index(df)
+        if log_cache and progress:
+            pre = f'{progress[0]}/{progress[1]} ' if progress else ''
+            print(f'[60m] {pre}{symbol} — 无缓存 API {len(df)} 根', flush=True)
+        elif log_cache and not progress:
+            print(f'[60m] {symbol} — 无缓存 API {len(df)} 根', flush=True)
+        return df
+
+    def fetch_range(a: date, b: date) -> pd.DataFrame:
+        raw = _get_api_singleton()._fetch_hourly_range(symbol, a, b, adjust)
+        if raw is None or len(raw) == 0:
+            return pd.DataFrame()
+        return normalize_df_index(raw)
+
+    df, _msg = merge_hourly_cache(
         symbol,
         start_date,
         end_date,

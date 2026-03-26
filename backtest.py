@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-港股 + 美股 日K 趋势突破回测（纯技术面）
+港股 + 美股 日 K + 60m 对称信号回测（纯技术面，不含止损/止盈）
 
-无未来函数要点：回测日 T 仅用截止 T-1 的日线；突破与通道均对前一日指标 shift(1)；
-成交价按昨收简化，实盘中通常更差。详见项目 README。
+无未来函数：日频决策仅用 ≤T−1 的日线；60m 结构仅用「日历日 < T」的已收盘柱，
+当日微观条件仅用「首根 60m 已走完」后再用第二根开盘价成交。
+
+模型：入场 = 日 K 突破+趋势+量能 ∧ 对称的 60m 条件；出场 = 日 K 下破或趋势空头，
+或（镜像地）60m 下破/均线空头/首根收阴 —— 全部为可解释的技术信号，无固定止损与移动止盈。
+详见 README。
 """
 
 from __future__ import annotations
@@ -14,7 +18,7 @@ import os
 import sys
 import time
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -32,19 +36,28 @@ except ImportError:
 # =============================================================================
 
 # 主回测区间（推理；训练期仅在 train_params.py 配置）
-# 可用环境变量覆盖（便于一次性实验）：BACKTEST_START / BACKTEST_END，格式 YYYY-MM-DD
-_DEFAULT_BACKTEST_START = date(2024, 1, 1)
-_DEFAULT_BACKTEST_END = date(2025, 12, 31)
+# 与 60m 可拉取起点对齐：默认自 2024-04-01（同 TREND_HOURLY_MIN_DATE）
+# 可用环境变量覆盖：BACKTEST_START / BACKTEST_END，格式 YYYY-MM-DD；不设 BACKTEST_END 则默认到今天
+_DEFAULT_BACKTEST_START = date(2024, 4, 1)
+_DEFAULT_BACKTEST_END: Optional[date] = None  # None 表示运行当日（见 main）
+
 BACKTEST_START = (
     date.fromisoformat(os.environ['BACKTEST_START'])
     if os.environ.get('BACKTEST_START')
     else _DEFAULT_BACKTEST_START
 )
-BACKTEST_END = (
-    date.fromisoformat(os.environ['BACKTEST_END'])
-    if os.environ.get('BACKTEST_END')
-    else _DEFAULT_BACKTEST_END
-)  # 不设环境变量时也可在代码中改为 None 表示到今天
+_BACKTEST_END_RAW = os.environ.get('BACKTEST_END', '').strip()
+BACKTEST_END = date.fromisoformat(_BACKTEST_END_RAW) if _BACKTEST_END_RAW else _DEFAULT_BACKTEST_END
+
+
+def strategy_anchor_date() -> date:
+    """与 Longport 60m 可拉取起点一致（默认 2024-04-01，同 hk_stock_api.TREND_HOURLY_MIN_DATE）。"""
+    raw = os.getenv('TREND_HOURLY_MIN_DATE', '2024-04-01').strip()
+    try:
+        return date.fromisoformat(raw)
+    except ValueError:
+        return date(2024, 4, 1)
+
 
 # 股票池 CSV（symbol 列）。空字符串则依次尝试 dual_universe.csv、dual_universe.example.csv
 UNIVERSE_CSV = ""
@@ -76,30 +89,32 @@ _BACKTEST_CLOSE_LAST = os.environ.get('BACKTEST_CLOSE_ALL_LAST_DAY', '').strip()
 CLOSE_ALL_POSITIONS_LAST_DAY = _BACKTEST_CLOSE_LAST not in ('0', 'false', 'no', 'off')
 
 # —— 策略参数（若存在 trained_strategy_params.json 则由训练覆盖；否则用此处默认）——
-STOP_LOSS_PCT = 0.10
-BREAKOUT_LOOKBACK = 40
+# 出场与入场对称：通道宽度与突破共用 BREAKOUT_LOOKBACK（跌破 N 日滚动最低价）
+BREAKOUT_LOOKBACK = 65
 TREND_MA_PERIOD = 50
 VOL_MA_PERIOD = 20
-VOLUME_RATIO_THRESHOLD = 1.2
-EXIT_DONCHIAN_DAYS = 20
-USE_MA60_LOSS_EXIT = True
+VOLUME_RATIO_THRESHOLD = 1.3
 ONE_WAY_COST_RATE = 0.0  # 单边费率，如万 3 填 0.00015（买/卖各收一次需自行理解口径）
 
-# 大盘过滤：恒指、SPY 均在长均线上方才允许新开仓（训练选优为关）
-USE_REGIME_FILTER = False
+# 大盘过滤：恒指、SPY 均在长均线上方才允许新开仓（train_params --exp-multitarget 全池最优为开）
+USE_REGIME_FILTER = True
 REGIME_BENCHMARKS: List[str] = ['HSI.HK', 'SPY.US']
 REGIME_MODE = 'all'  # 'all' = 全部在均线上；'any' = 任一在均线上
 REGIME_MA_DAYS = 200
 
-# 波动率目标：按标的实现波动缩放单笔仓位（0 表示关闭）
-VOL_TARGET_ANNUAL = 0.15
+# 波动率目标：按标的实现波动缩放单笔仓位（0=关闭；纯信号验证建议 0）
+VOL_TARGET_ANNUAL = 0.0
 VOL_LOOKBACK = 20
 VOL_SCALE_MIN = 0.35
 VOL_SCALE_MAX = 2.5
 
-# 移动止盈：浮盈达到比例后，自持仓以来最高价回撤超过比例则清仓（任一为 0 则关闭）
-TRAILING_ACTIVATION_PCT = 0.12
-TRAILING_STOP_PCT = 0.09
+# 60m K：与日线对称；0 表示关闭该项（入场与出场同时不检查该维度）
+# —— 仅使用「日历日 T 之前」已走完的 60m 柱；首根微观需该根已收盘 ——
+HOURLY_MA_PERIOD = 0  # 入场：末根收盘 > H 均；出场：末根收盘 < H 均；0=仅用日K+首根阴阳（Longport 60m 历史见 TREND_HOURLY_MIN_DATE，默认 2024-04-01）
+HOURLY_BREAKOUT_BARS = 0  # 入场：小时突破；出场：小时下破（同构）
+USE_HOURLY_FIRST_BAR_BULLISH = True  # 入场：首根收阳；出场：首根收阴（镜像）
+# 当日 60m 不足 2 根或历史不足时，不卡死（与 API 历史起点/缺数据相容）
+RELAX_HOURLY_WHEN_INCOMPLETE = True
 
 # 流动性区间（近 lookback 日均成交额，港元/美元视市场而定）
 HK_AVG_TURNOVER_MIN = 5e6
@@ -122,6 +137,7 @@ class HistoricalDataManager:
 
     def __init__(self) -> None:
         self._all_data: Dict[str, pd.DataFrame] = {}
+        self._hourly_data: Dict[str, pd.DataFrame] = {}
         self._current_date: Optional[date] = None
         self._min_history_days: int = MIN_HISTORY_DAYS_LOAD
 
@@ -240,8 +256,17 @@ class HistoricalDataManager:
         return bool(last_c > last_ma)
 
 
+def _hourly_bars_on_date(df: pd.DataFrame, d: date) -> pd.DataFrame:
+    """按交易所日历日筛选 60m K（索引为 datetime）。"""
+    if df is None or len(df) == 0:
+        return pd.DataFrame()
+    dv = df.index.map(lambda x: pd.Timestamp(x).date())
+    sub = df.loc[dv == d].copy()
+    return sub.sort_index()
+
+
 class DualMarketDataManager(HistoricalDataManager):
-    """港股 / 美股分档成交额过滤。"""
+    """港股 / 美股分档成交额过滤；含 60m K（Min_60）缓存供成交价。"""
 
     def __init__(
         self,
@@ -292,7 +317,6 @@ class DualMarketDataManager(HistoricalDataManager):
         breakout_lookback: int = 55,
         trend_ma_period: int = 50,
         vol_ma_period: int = 20,
-        exit_donchian_days: int = 20,
     ) -> Optional[pd.DataFrame]:
         df = self.get_history(symbol)
         if df is None:
@@ -304,11 +328,142 @@ class DualMarketDataManager(HistoricalDataManager):
         df['high_nd'] = df['high'].rolling(breakout_lookback).max()
         df['is_breakout'] = df['close'] > df['high_nd'].shift(1)
         df['trend_ok'] = df['close'] > df['ma_trend']
-        df['low_exit_level'] = df['low'].rolling(exit_donchian_days).min().shift(1)
+        # 与突破对称：同窗口 N 日最低价通道下破
+        df['low_nd'] = df['low'].rolling(breakout_lookback).min()
+        df['is_breakdown'] = df['close'] < df['low_nd'].shift(1)
+        df['trend_bear'] = df['close'] < df['ma_trend']
         df['turnover'] = df['close'] * df['volume']
         df['avg_turnover_20d'] = df['turnover'].rolling(20).mean()
-        df['ma60'] = df['close'].rolling(60).mean()
         return df
+
+    def load_hourly_data(self, symbols: List[str], start_date: date, end_date: date) -> int:
+        from daily_cache import normalize_df_index
+        from hk_stock_api import fetch_hourly_bars
+
+        loaded = 0
+        pause = float(os.getenv('LONGPORT_REQUEST_PAUSE', '0.15'))
+        for i, symbol in enumerate(symbols):
+            try:
+                df = fetch_hourly_bars(
+                    symbol,
+                    start_date,
+                    end_date,
+                    log_cache=False,
+                    progress=None,
+                )
+                if df is not None and len(df) > 0:
+                    self._hourly_data[symbol] = normalize_df_index(df)
+                    loaded += 1
+            except Exception as e:
+                print(f'[60m] {symbol} 加载异常: {e}', flush=True)
+            finally:
+                if pause > 0 and i + 1 < len(symbols):
+                    time.sleep(pause)
+        print(
+            f'[60m] 批量加载完成: {loaded}/{len(symbols)} 只有效（{start_date}～{end_date}）；'
+            f'缓存目录 data_cache/hourly_60/',
+            flush=True,
+        )
+        return loaded
+
+    def second_hour_open(self, symbol: str, d: date) -> Optional[float]:
+        """当日按时间排序的第 2 根 60m K 的开盘价（第 1 根为 0）。"""
+        df = self._hourly_data.get(symbol)
+        if df is None or len(df) == 0:
+            return None
+        sub = _hourly_bars_on_date(df, d)
+        if len(sub) < 2:
+            return None
+        return float(sub.iloc[1]['open'])
+
+    def hourly_first_hour_bullish(self, symbol: str, d: date) -> bool:
+        """第一根 60m K 收阳（close>open），作微观确认；数据不足则 False。"""
+        df = self._hourly_data.get(symbol)
+        if df is None or len(df) == 0:
+            return False
+        sub = _hourly_bars_on_date(df, d)
+        if len(sub) < 2:
+            return False
+        r0 = sub.iloc[0]
+        return float(r0['close']) > float(r0['open'])
+
+    def hourly_bars_before_date(self, symbol: str, d: date) -> pd.DataFrame:
+        """严格早于日历日 d 的全部 60m K（用于 T 开盘前可知的短周期结构）。"""
+        df = self._hourly_data.get(symbol)
+        if df is None or len(df) == 0:
+            return pd.DataFrame()
+        dv = df.index.map(lambda x: pd.Timestamp(x).date())
+        sub = df.loc[dv < d].copy()
+        return sub.sort_index()
+
+    def hourly_ma_trend_ok(self, symbol: str, d: date, ma_period: int) -> bool:
+        """最后一根已完成 60m 收盘 > 近 ma_period 根收盘均值（均线在「之前」的柱上算）。"""
+        if ma_period <= 0:
+            return True
+        sub = self.hourly_bars_before_date(symbol, d)
+        if len(sub) < ma_period:
+            return False
+        last_close = float(sub.iloc[-1]['close'])
+        ma = float(sub['close'].astype(float).tail(ma_period).mean())
+        return last_close > ma
+
+    def hourly_breakout_ok(self, symbol: str, d: date, lookback: int) -> bool:
+        """与日 K 突破同构：close > rolling(high,lookback).max().shift(1)，在「T 之前」的 60m 序列末行判定。"""
+        if lookback <= 0:
+            return True
+        sub = self.hourly_bars_before_date(symbol, d)
+        if len(sub) < lookback + 1:
+            return False
+        h = sub['high'].astype(float)
+        c = sub['close'].astype(float)
+        high_nd = h.rolling(lookback).max().shift(1)
+        hv = high_nd.iloc[-1]
+        if pd.isna(hv):
+            return False
+        return float(c.iloc[-1]) > float(hv)
+
+    def hourly_bar_count_on_date(self, symbol: str, d: date) -> int:
+        """日历日 d 上已走完的 60m 根数（用于判断是否可做首根阴阳过滤）。"""
+        df = self._hourly_data.get(symbol)
+        if df is None or len(df) == 0:
+            return 0
+        return len(_hourly_bars_on_date(df, d))
+
+    def hourly_first_hour_bearish(self, symbol: str, d: date) -> bool:
+        """第一根 60m 收阴（close<open），与首根收阳对称；数据不足则 False。"""
+        df = self._hourly_data.get(symbol)
+        if df is None or len(df) == 0:
+            return False
+        sub = _hourly_bars_on_date(df, d)
+        if len(sub) < 2:
+            return False
+        r0 = sub.iloc[0]
+        return float(r0['close']) < float(r0['open'])
+
+    def hourly_ma_trend_bear(self, symbol: str, d: date, ma_period: int) -> bool:
+        """与 hourly_ma_trend_ok 对称：末根收盘 < 近 ma_period 根收盘均值。"""
+        if ma_period <= 0:
+            return False
+        sub = self.hourly_bars_before_date(symbol, d)
+        if len(sub) < ma_period:
+            return False
+        last_close = float(sub.iloc[-1]['close'])
+        ma = float(sub['close'].astype(float).tail(ma_period).mean())
+        return last_close < ma
+
+    def hourly_breakdown_ok(self, symbol: str, d: date, lookback: int) -> bool:
+        """与 hourly_breakout_ok 对称：close < rolling(low,lookback).min().shift(1)。"""
+        if lookback <= 0:
+            return False
+        sub = self.hourly_bars_before_date(symbol, d)
+        if len(sub) < lookback + 1:
+            return False
+        low_nd = sub['low'].astype(float).rolling(lookback).min().shift(1)
+        c = sub['close'].astype(float)
+        lv = low_nd.iloc[-1]
+        if pd.isna(lv):
+            return False
+        return float(c.iloc[-1]) < float(lv)
 
 
 class DualBreakoutEngine:
@@ -317,13 +472,10 @@ class DualBreakoutEngine:
         self.config = config or {}
         self.max_positions = int(self.config.get('max_positions', 10))
         self.position_size_pct = float(self.config.get('position_size_pct', 0.10))
-        self.stop_loss_pct = float(self.config.get('stop_loss_pct', 0.12))
         self.breakout_lookback = int(self.config.get('breakout_lookback', 55))
         self.trend_ma_period = int(self.config.get('trend_ma_period', 50))
         self.vol_ma_period = int(self.config.get('vol_ma_period', 20))
         self.volume_ratio_threshold = float(self.config.get('volume_ratio_threshold', 1.2))
-        self.exit_donchian_days = int(self.config.get('exit_donchian_days', 20))
-        self.use_ma60_loss_exit = bool(self.config.get('use_ma60_loss_exit', True))
         self.one_way_cost_rate = float(self.config.get('one_way_cost_rate', 0.0))
         self.use_regime_filter = bool(self.config.get('use_regime_filter', False))
         self.regime_benchmarks: List[str] = list(self.config.get('regime_benchmarks', ['HSI.HK', 'SPY.US']))
@@ -333,10 +485,14 @@ class DualBreakoutEngine:
         self.vol_lookback = int(self.config.get('vol_lookback', 20))
         self.vol_scale_min = float(self.config.get('vol_scale_min', 0.35))
         self.vol_scale_max = float(self.config.get('vol_scale_max', 2.5))
-        self.trailing_activation_pct = float(self.config.get('trailing_activation_pct', 0.0))
-        self.trailing_stop_pct = float(self.config.get('trailing_stop_pct', 0.0))
         ss = self.config.get('symbols_subset')
         self.symbols_subset: Optional[Set[str]] = set(ss) if ss else None
+        self.hourly_ma_period = int(self.config.get('hourly_ma_period', 0))
+        self.hourly_breakout_bars = int(self.config.get('hourly_breakout_bars', 0))
+        self.use_hourly_first_bar_bullish = bool(self.config.get('use_hourly_first_bar_bullish', True))
+        self.relax_hourly_when_incomplete = bool(
+            self.config.get('relax_hourly_when_incomplete', RELAX_HOURLY_WHEN_INCOMPLETE)
+        )
 
         self.initial_capital = float(self.config.get('initial_capital', 100000))
         self.cash = self.initial_capital
@@ -407,8 +563,72 @@ class DualBreakoutEngine:
             breakout_lookback=self.breakout_lookback,
             trend_ma_period=self.trend_ma_period,
             vol_ma_period=self.vol_ma_period,
-            exit_donchian_days=self.exit_donchian_days,
         )
+
+    def _daily_exit_triggered(self, row: pd.Series) -> Tuple[bool, str]:
+        """纯日 K 出场：通道下破或趋势空头（与突破/趋势多头对称）。"""
+        if bool(row.get('is_breakdown', False)):
+            return True, f'日K跌破{self.breakout_lookback}日低通道'
+        if bool(row.get('trend_bear', False)):
+            return True, f'日K跌破趋势MA{self.trend_ma_period}'
+        return False, ''
+
+    def _hourly_exit_triggered(self, symbol: str, current_date: date) -> Tuple[bool, str]:
+        """纯 60m 出场：与 _extra_buy_ok 各维度一一镜像。"""
+        if self.hourly_ma_period > 0:
+            need = self.hourly_ma_period
+            hb = self.dm.hourly_bars_before_date(symbol, current_date)
+            if len(hb) >= need and self.dm.hourly_ma_trend_bear(symbol, current_date, self.hourly_ma_period):
+                return True, '60m收盘低于短均线'
+        if self.hourly_breakout_bars > 0:
+            need_b = self.hourly_breakout_bars + 1
+            hb2 = self.dm.hourly_bars_before_date(symbol, current_date)
+            if len(hb2) >= need_b and self.dm.hourly_breakdown_ok(
+                symbol, current_date, self.hourly_breakout_bars
+            ):
+                return True, '60m下破前低通道'
+        if self.use_hourly_first_bar_bullish:
+            n = self.dm.hourly_bar_count_on_date(symbol, current_date)
+            if n >= 2 and self.dm.hourly_first_hour_bearish(symbol, current_date):
+                return True, '首根60m收阴'
+        return False, ''
+
+    def _execution_price_for_signal(self, symbol: str, current_date: date) -> Optional[float]:
+        """优先第二根 60m K 开盘价；无小时数据时回退为日 K（T-1）收盘价。"""
+        o = self.dm.second_hour_open(symbol, current_date)
+        if o is not None and o > 0:
+            return float(o)
+        df = self._ind(symbol)
+        if df is None or len(df) < 1:
+            return None
+        return float(df.iloc[-1]['close'])
+
+    def _extra_buy_ok(self, symbol: str, current_date: date) -> bool:
+        """日 K 条件已满足后，再叠加 60m：可选首根收阳 + T 之前的小时均线/小时突破（参数可优化）。"""
+        relax = self.relax_hourly_when_incomplete
+        if self.use_hourly_first_bar_bullish:
+            n = self.dm.hourly_bar_count_on_date(symbol, current_date)
+            if n < 2:
+                if not relax:
+                    return False
+            elif not self.dm.hourly_first_hour_bullish(symbol, current_date):
+                return False
+        if self.hourly_ma_period > 0:
+            hb = self.dm.hourly_bars_before_date(symbol, current_date)
+            if len(hb) < self.hourly_ma_period:
+                if not relax:
+                    return False
+            elif not self.dm.hourly_ma_trend_ok(symbol, current_date, self.hourly_ma_period):
+                return False
+        if self.hourly_breakout_bars > 0:
+            need = self.hourly_breakout_bars + 1
+            hb2 = self.dm.hourly_bars_before_date(symbol, current_date)
+            if len(hb2) < need:
+                if not relax:
+                    return False
+            elif not self.dm.hourly_breakout_ok(symbol, current_date, self.hourly_breakout_bars):
+                return False
+        return True
 
     def run(
         self,
@@ -419,7 +639,7 @@ class DualBreakoutEngine:
         compare_indices: Optional[Dict[str, pd.DataFrame]] = None,
     ) -> dict:
         self._verbose = verbose
-        warmup = max(self.breakout_lookback, self.trend_ma_period, self.exit_donchian_days, 60) + 5
+        warmup = max(self.breakout_lookback, self.trend_ma_period, 60) + 5
 
         all_dates = self.dm.get_all_trading_dates()
         trading_dates = [d for d in all_dates if start_date <= d <= end_date]
@@ -427,13 +647,20 @@ class DualBreakoutEngine:
 
         if verbose:
             print('\n' + '=' * 60)
-            print('双市场日K趋势突破')
+            print('对称信号模型：日K+60m 联合开平仓（纯技术信号，无止损/移动止盈）')
             print('=' * 60)
+            h1 = '首根60m阳/阴' if self.use_hourly_first_bar_bullish else '不要求首根60m阴阳'
+            h2 = f'hMA{self.hourly_ma_period}' if self.hourly_ma_period > 0 else '关h均线'
+            h3 = f'h突破/下破{self.hourly_breakout_bars}根' if self.hourly_breakout_bars > 0 else '关h突破下破'
+            N = self.breakout_lookback
+            print(
+                f'  入场 日K：突破+趋势+量比；出场 日K：同{N}日低通道下破或趋势空头；'
+                f'60m：{h2}；{h3}；{h1}；成交第二根60m开盘。',
+                flush=True,
+            )
             print(f'初始资金: {self.initial_capital:,.0f}  区间: {start_date} ~ {end_date}')
             print(
-                f'参数: 突破{self.breakout_lookback}日高 | 趋势MA{self.trend_ma_period} | '
-                f'量比≥{self.volume_ratio_threshold} | 止损{self.stop_loss_pct:.0%} | '
-                f'唐奇安出场{self.exit_donchian_days}日低'
+                f'参数: 通道宽{N}日 | 趋势MA{self.trend_ma_period} | 量比≥{self.volume_ratio_threshold}'
             )
             extra = []
             if self.use_regime_filter:
@@ -442,10 +669,6 @@ class DualBreakoutEngine:
                 )
             if self.vol_target_annual > 0:
                 extra.append(f'波动目标{self.vol_target_annual:.0%}年化({self.vol_lookback}日)')
-            if self.trailing_activation_pct > 0 and self.trailing_stop_pct > 0:
-                extra.append(
-                    f'移动止盈 浮盈≥{self.trailing_activation_pct:.0%}后回撤{self.trailing_stop_pct:.0%}清仓'
-                )
             if extra:
                 print('  ' + ' | '.join(extra))
             print(f'交易日数: {len(trading_dates)}  预热跳过: {warmup} 天')
@@ -462,7 +685,7 @@ class DualBreakoutEngine:
                 npos = len(self.positions)
                 if self._verbose:
                     print(
-                        f'[回测] 最后交易日 {current_date}：期末强制平仓 {npos} 只（按昨收）',
+                        f'[回测] 最后交易日 {current_date}：期末强制平仓 {npos} 只',
                         flush=True,
                     )
                 self._liquidate_all_at_backtest_end(current_date, '回测期末平仓')
@@ -471,16 +694,18 @@ class DualBreakoutEngine:
         return self._generate_report(benchmark_data, verbose, compare_indices)
 
     def _liquidate_all_at_backtest_end(self, current_date: date, reason: str) -> None:
-        """回测区间末日：按当日信号用的收盘价卖出全部持仓。"""
+        """回测区间末日：按 _execution_price_for_signal 卖出全部持仓。"""
         for symbol in list(self.positions.keys()):
-            df = self._ind(symbol)
-            if df is not None and len(df) >= 1:
-                price = float(df.iloc[-1]['close'])
-            else:
-                px = self.dm.get_latest_price(symbol)
-                if px is None:
-                    continue
-                price = float(px)
+            price = self._execution_price_for_signal(symbol, current_date)
+            if price is None or price <= 0:
+                df = self._ind(symbol)
+                if df is not None and len(df) >= 1:
+                    price = float(df.iloc[-1]['close'])
+                else:
+                    px = self.dm.get_latest_price(symbol)
+                    if px is None:
+                        continue
+                    price = float(px)
             self._execute_sell(current_date, symbol, price, 1.0, reason)
 
     def _update_positions(self) -> None:
@@ -488,8 +713,6 @@ class DualBreakoutEngine:
             px = self.dm.get_latest_price(sym)
             if px:
                 self.positions[sym]['current_price'] = px
-                pk = self.positions[sym].get('peak_close', px)
-                self.positions[sym]['peak_close'] = max(pk, px)
 
     def _check_buy_signals(self, current_date: date, pool: List[str]) -> None:
         if len(self.positions) >= self.max_positions:
@@ -514,7 +737,11 @@ class DualBreakoutEngine:
             lo, _ = self.dm._turn_bounds(symbol)
             if pd.isna(avg_to) or float(avg_to) < lo:
                 continue
-            px = float(row['close'])
+            if not self._extra_buy_ok(symbol, current_date):
+                continue
+            px = self._execution_price_for_signal(symbol, current_date)
+            if px is None or px <= 0:
+                continue
             vs = self._vol_scale(symbol)
             self._execute_buy(
                 current_date,
@@ -530,46 +757,16 @@ class DualBreakoutEngine:
             if df is None or len(df) < 1:
                 continue
             row = df.iloc[-1]
-            pos = self.positions[symbol]
-            price = float(row['close'])
-            buy_price = pos['buy_price']
-            pnl_pct = price / buy_price - 1.0
-
-            if pnl_pct < -self.stop_loss_pct:
-                self._execute_sell(current_date, symbol, price, 1.0, f'止损 {pnl_pct:.1%}')
+            fill_px = self._execution_price_for_signal(symbol, current_date)
+            if fill_px is None or fill_px <= 0:
                 continue
 
-            if (
-                self.trailing_activation_pct > 0
-                and self.trailing_stop_pct > 0
-                and pnl_pct >= self.trailing_activation_pct
-            ):
-                peak = float(pos.get('peak_close', price))
-                if peak > 0 and (peak - price) / peak >= self.trailing_stop_pct:
-                    self._execute_sell(
-                        current_date,
-                        symbol,
-                        price,
-                        1.0,
-                        f'移动止盈 峰值回撤{(peak - price) / peak:.1%}',
-                    )
-                    continue
-
-            low_exit = row.get('low_exit_level')
-            if low_exit is not None and pd.notna(low_exit) and price < float(low_exit):
-                self._execute_sell(
-                    current_date,
-                    symbol,
-                    price,
-                    1.0,
-                    f'跌破{self.exit_donchian_days}日低 盈亏{pnl_pct:+.1%}',
-                )
+            d_ok, d_reason = self._daily_exit_triggered(row)
+            h_ok, h_reason = self._hourly_exit_triggered(symbol, current_date)
+            if not d_ok and not h_ok:
                 continue
-
-            if self.use_ma60_loss_exit:
-                ma60 = row.get('ma60', 0)
-                if ma60 and ma60 > 0 and price < float(ma60) and pnl_pct < 0:
-                    self._execute_sell(current_date, symbol, price, 1.0, '跌破MA60且亏')
+            reason = d_reason if d_ok else h_reason
+            self._execute_sell(current_date, symbol, fill_px, 1.0, reason)
 
     def _execute_buy(
         self,
@@ -597,7 +794,6 @@ class DualBreakoutEngine:
             'buy_price': price,
             'buy_date': str(current_date),
             'current_price': price,
-            'peak_close': price,
         }
         self.trades.append(
             {
@@ -719,6 +915,15 @@ class DualBreakoutEngine:
 
         buys = [t for t in self.trades if t['action'] == 'BUY']
         sells = [t for t in self.trades if t['action'] == 'SELL']
+        round_trip_count = len(sells)
+        trading_years = max(days, 1) / 252.0
+        trades_per_year = round_trip_count / trading_years if trading_years > 0 else 0.0
+        winning_sells = [
+            t
+            for t in sells
+            if t.get('realized_pnl_pct') is not None and float(t['realized_pnl_pct']) > 0.0
+        ]
+        win_rate = 100.0 * len(winning_sells) / len(sells) if sells else 0.0
 
         if verbose:
             print('\n' + '=' * 60 + '\n回测结果\n' + '=' * 60)
@@ -777,7 +982,10 @@ class DualBreakoutEngine:
                             f'策略相对两指数的超额之差 {d_ex:+.2f}%（= 相对恒指超额 − 相对科技超额）。'
                             f'恒指跌得更多时，同一策略收益下「相对恒指超额」往往高于「相对科技超额」。'
                         )
-            print(f'\n【交易】买入{len(buys)} 卖出{len(sells)}  期末持仓{len(self.positions)}只')
+            print(
+                f'\n【交易】买入{len(buys)} 卖出{len(sells)}（约 {trades_per_year:.1f} 笔完整交易/年）'
+                f'  胜率(按卖出笔): {win_rate:.1f}%  期末持仓{len(self.positions)}只'
+            )
             if self.trades:
                 cmap = load_hk_cn_name_map(HK_CN_NAMES_CSV)
                 cmap = enrich_cn_map_for_trades(cmap, self.trades)
@@ -806,6 +1014,9 @@ class DualBreakoutEngine:
             'sharpe_ratio': sharpe,
             'sortino_ratio': sortino,
             'trade_count': len(buys) + len(sells),
+            'round_trip_count': round_trip_count,
+            'trades_per_year': trades_per_year,
+            'win_rate': win_rate,
             'benchmark_return': bench_ret,
             'excess_return': ex,
             'yearly_returns': yearly,
@@ -1117,13 +1328,10 @@ def engine_config(symbols: List[str]) -> dict:
         'initial_capital': INITIAL_CAPITAL,
         'max_positions': MAX_POSITIONS,
         'position_size_pct': POSITION_SIZE_PCT,
-        'stop_loss_pct': STOP_LOSS_PCT,
         'breakout_lookback': BREAKOUT_LOOKBACK,
         'trend_ma_period': TREND_MA_PERIOD,
         'vol_ma_period': VOL_MA_PERIOD,
         'volume_ratio_threshold': VOLUME_RATIO_THRESHOLD,
-        'exit_donchian_days': EXIT_DONCHIAN_DAYS,
-        'use_ma60_loss_exit': USE_MA60_LOSS_EXIT,
         'one_way_cost_rate': ONE_WAY_COST_RATE,
         'use_regime_filter': USE_REGIME_FILTER,
         'regime_benchmarks': REGIME_BENCHMARKS,
@@ -1133,10 +1341,12 @@ def engine_config(symbols: List[str]) -> dict:
         'vol_lookback': VOL_LOOKBACK,
         'vol_scale_min': VOL_SCALE_MIN,
         'vol_scale_max': VOL_SCALE_MAX,
-        'trailing_activation_pct': TRAILING_ACTIVATION_PCT,
-        'trailing_stop_pct': TRAILING_STOP_PCT,
         'close_all_last_day': CLOSE_ALL_POSITIONS_LAST_DAY,
         'symbols_subset': set(symbols),
+        'hourly_ma_period': HOURLY_MA_PERIOD,
+        'hourly_breakout_bars': HOURLY_BREAKOUT_BARS,
+        'use_hourly_first_bar_bullish': USE_HOURLY_FIRST_BAR_BULLISH,
+        'relax_hourly_when_incomplete': RELAX_HOURLY_WHEN_INCOMPLETE,
     }
     ov = load_trained_strategy_param_overrides()
     if ov:
@@ -1183,16 +1393,31 @@ def main() -> None:
 
     dm = DualMarketDataManager()
     load_syms = list(dict.fromkeys(symbols + ['HSI.HK', 'SPY.US', 'HSTECH.HK']))
+    anchor = strategy_anchor_date()
+    hourly_load_start = max(data_start, anchor)
+
     print(
         f'[回测] 加载 {len(load_syms)} 个标的日线（缓存在 data_cache/daily/，详见 README）',
         flush=True,
     )
     print(
-        f'[回测] 请求区间：{data_start} ~ {end_date}（起点早于回测日约 {DATA_WARMUP_DAYS_BEFORE_START} 自然日，供指标预热；'
+        f'[回测] 日线请求：{data_start} ~ {end_date}（较交易起点早约 {DATA_WARMUP_DAYS_BEFORE_START} 自然日，仅用于日频指标预热；'
         f'不产生 {start_bt} 以前的交易）。',
         flush=True,
     )
+    print(
+        f'[回测] 策略锚点（日K+60m 决策与统计起点）：{anchor}（与 TREND_HOURLY_MIN_DATE 一致）；'
+        f'交易与净值区间：{start_bt} ~ {end_date}。',
+        flush=True,
+    )
     dm.load_stock_data(load_syms, data_start, end_date)
+    sym_trade = [s for s in symbols if s.endswith('.HK') or s.endswith('.US')]
+    if sym_trade:
+        print(
+            f'[回测] 60m 请求：{hourly_load_start} ~ {end_date}（不低于锚点，且与日线窗口重叠；API 另有单次条数上限与分批拉取）。',
+            flush=True,
+        )
+        dm.load_hourly_data(sym_trade, hourly_load_start, end_date)
 
     if symbols:
         s0 = symbols[0]
@@ -1236,7 +1461,7 @@ def main() -> None:
             flush=True,
         )
     print(
-        f'[回测] 数据就绪。**交易与净值统计区间**：{start_bt} ~ {end_date}（仅此段计入回测结果）。',
+        f'[回测] 数据就绪。交易与净值统计区间：{start_bt} ~ {end_date}（仅此段计入回测结果）。',
         flush=True,
     )
     cfg = engine_config(symbols)

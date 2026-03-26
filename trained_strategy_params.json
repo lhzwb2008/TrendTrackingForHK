@@ -1,29 +1,26 @@
 {
-  "version": 1,
-  "saved_at": "2026-03-24T12:40:00",
+  "version": 3,
+  "saved_at": "2026-03-26T10:50:00",
   "train_period": {
-    "start": "2020-01-01",
-    "end": "2023-12-31"
+    "start": "2024-04-01",
+    "end": "2025-08-31"
   },
   "test_period": {
-    "start": "2024-01-01",
-    "end": "2025-12-31"
+    "start": "2025-09-01",
+    "end": "2026-03-26"
   },
   "metrics": {
-    "train_sharpe_best": 0.5952080368479673,
-    "test_sharpe_oos": 1.059849043438762
+    "train_sharpe_best": 0.7692,
+    "test_sharpe_oos": 0.2131
   },
   "params": {
-    "breakout_lookback": 40,
-    "stop_loss_pct": 0.1,
-    "volume_ratio_threshold": 1.2,
-    "use_regime_filter": false,
-    "vol_target_annual": 0.15,
-    "exit_donchian_days": 20,
-    "trend_ma_period": 50,
-    "vol_ma_period": 20,
-    "trailing_activation_pct": 0.12,
-    "trailing_stop_pct": 0.09,
-    "use_ma60_loss_exit": true
+    "breakout_lookback": 65,
+    "volume_ratio_threshold": 1.3,
+    "use_regime_filter": true,
+    "vol_target_annual": 0.0,
+    "hourly_ma_period": 0,
+    "hourly_breakout_bars": 0,
+    "use_hourly_first_bar_bullish": true,
+    "relax_hourly_when_incomplete": true
   }
 }
