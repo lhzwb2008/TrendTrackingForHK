@@ -74,7 +74,7 @@ def merge_daily_cache(
 ) -> Tuple[pd.DataFrame, str]:
     """
     合并本地缓存与增量请求，返回 [start_date, end_date] 切片。
-    fetch_range(a,b) 应与 hk_stock_api 内单次区间拉取行为一致。
+    fetch_range(a,b) 应与 longport_api 内单次区间拉取行为一致。
     """
     path = daily_cache_path(symbol)
     cached = _load_cache(path)
