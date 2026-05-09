@@ -24,9 +24,10 @@ from __future__ import annotations
 # ============================================================================
 
 # ---- 回测区间与本金 ----
-BACKTEST_START = "2020-01-01"      # 回测起点；股票在该日之前未上市的，从其上市日起参与
+BACKTEST_START = "2024-05-08"      # 回测起点；股票在该日之前未上市的，从其上市日起参与
+                                    # 注意：Longport 分钟 K 仅回溯 ~2 年；早于此无法做日内决策
 BACKTEST_END   = "today"            # "today" 或 "YYYY-MM-DD"
-STARTING_CAPITAL = 1_000_000        # 起始本金（美元），仅用于显示与 P&L 美元金额
+STARTING_CAPITAL = 100000       # 起始本金（美元），仅用于显示与 P&L 美元金额
 
 # ---- 持仓结构 ----
 K_LONG  = 8                         # 最多同时持有的多头数
@@ -70,6 +71,12 @@ TAF_PER_SHARE        = 0.000166     # 交易活动费（仅卖出方收取）
 TAF_MAX_PER_ORDER    = 8.3
 SLIPPAGE_BPS         = 5.0          # 单侧滑点（基点；买入抬价 / 卖出压价）
 
+# ---- 日内决策（方案：分钟 K 模拟实盘 15:50 决策） ----
+INTRADAY_PERIOD  = "5min"           # 1min / 5min / 15min / 30min / 60min
+DECISION_TIME_ET = "15:50"          # 美东时间 HH:MM；决策与成交时点（NAS100 收盘前 10 分钟）
+                                    # 实盘流程：每日该时点跑一次脚本 → 立即提交订单
+                                    # 注意：分钟数据 Longport 仅回溯 ~2 年
+
 # ---- 输出 ----
 VERBOSE_TRADES = True               # 控制台打印每一笔交易的开/平仓
 PRINT_DAILY_POSITIONS = False       # True 时每日打印当前持仓快照（很啰嗦，调试用）
@@ -88,6 +95,10 @@ import numpy as np
 import pandas as pd
 
 from longport_api import fetch_daily_bars, get_api_singleton
+from intraday_api import (
+    fetch_intraday_bars, filter_rth, to_et,
+    PERIOD_MINUTES, parse_decision_time,
+)
 from nas100_universe import get_universe
 
 
@@ -119,6 +130,8 @@ class Config:
     taf_per_share: float = TAF_PER_SHARE
     taf_max_per_order: float = TAF_MAX_PER_ORDER
     slippage_bps: float = SLIPPAGE_BPS
+    intraday_period: str = INTRADAY_PERIOD
+    decision_time_et: str = DECISION_TIME_ET
     verbose_trades: bool = VERBOSE_TRADES
     print_daily_positions: bool = PRINT_DAILY_POSITIONS
 
@@ -159,6 +172,92 @@ def load_all_data(symbols: List[str], start: date, end: date,
     return out
 
 
+def load_all_intraday(symbols: List[str], start: date, end: date,
+                      period_label: str) -> Dict[str, pd.DataFrame]:
+    """并发拉取分钟级 RTH 数据。Longport 限速下保守用 4 worker。"""
+    out: Dict[str, pd.DataFrame] = {}
+    max_workers = int(os.getenv("NAS100_INTRADAY_WORKERS", "4"))
+
+    try:
+        get_api_singleton()
+    except Exception as e:
+        print(f"[警告] Longport 初始化失败（若分钟数据已全部缓存可忽略）: {e}")
+
+    def _fetch(sym: str):
+        try:
+            df = fetch_intraday_bars(sym, start, end, period_label, log_cache=False)
+            if len(df) > 0:
+                df = filter_rth(df)
+            return sym, df
+        except Exception as e:
+            print(f"[警告] {sym} 分钟数据拉取失败: {e}")
+            return sym, pd.DataFrame()
+
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futs = [pool.submit(_fetch, s) for s in symbols]
+        for i, f in enumerate(as_completed(futs), 1):
+            sym, df = f.result()
+            if len(df) > 0:
+                out[sym] = df
+            if i % 10 == 0 or i == len(symbols):
+                print(f"  已加载分钟数据 {i}/{len(symbols)}")
+    print(f"[数据-分钟] 成功加载 {len(out)}/{len(symbols)} 个标的")
+    return out
+
+
+def summarize_intraday_per_day(intraday_df: pd.DataFrame, period_label: str,
+                                decision_time_et: str) -> pd.DataFrame:
+    """按 ET 交易日聚合分钟 K 至决策时点。
+
+    输出列：
+      gap_open      : 当日 RTH 第一根 bar 的 open（用于检测 gap-down/up 触发的止损成交价）
+      pd_open       : 当日 RTH 开盘价（≈ gap_open）
+      pd_high       : RTH 开盘 → 决策 bar 期间最高
+      pd_low        : RTH 开盘 → 决策 bar 期间最低
+      pd_close      : 决策 bar 收盘价（≈ 决策时点价格）
+      pd_volume     : RTH 开盘 → 决策 bar 期间累计成交量
+    索引 = pd.Timestamp（normalize 到日，与 daily_cache 索引一致）
+    """
+    if intraday_df is None or len(intraday_df) == 0:
+        return pd.DataFrame()
+    period_min = PERIOD_MINUTES[period_label]
+    dec_h, dec_m = parse_decision_time(decision_time_et)
+    cutoff_start_sec = dec_h * 3600 + dec_m * 60 - period_min * 60
+
+    et = to_et(intraday_df.index)
+    df = intraday_df.copy()
+    df["__et_date"] = et.normalize().tz_localize(None)
+    df["__et_secs"] = et.hour * 3600 + et.minute * 60 + et.second
+    df = df[df["__et_secs"] <= cutoff_start_sec]
+    if df.empty:
+        return pd.DataFrame()
+
+    g = df.groupby("__et_date", sort=True)
+    summary = pd.DataFrame({
+        "gap_open": g["open"].first(),
+        "pd_open":  g["open"].first(),
+        "pd_high":  g["high"].max(),
+        "pd_low":   g["low"].min(),
+        "pd_close": g["close"].last(),
+        "pd_volume": g["volume"].sum(),
+    })
+    summary.index.name = None
+    return summary
+
+
+def merge_daily_with_intraday(daily_df: pd.DataFrame,
+                              intra_summary: pd.DataFrame) -> pd.DataFrame:
+    """将分钟聚合结果按日期左连接到日线，对应日缺失则该天无法决策。"""
+    if daily_df is None or len(daily_df) == 0:
+        return daily_df
+    if intra_summary is None or len(intra_summary) == 0:
+        # 没分钟数据 → 占位（这些日子无法决策）
+        for col in ("gap_open", "pd_open", "pd_high", "pd_low", "pd_close", "pd_volume"):
+            daily_df[col] = np.nan
+        return daily_df
+    return daily_df.join(intra_summary, how="left")
+
+
 # ---------------- 指标 ----------------
 
 def _ema(s, n): return s.ewm(span=n, adjust=False).mean()
@@ -195,6 +294,68 @@ def build_panel(data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
     return {sym: compute_indicators(df) for sym, df in data.items()}
 
 
+def compute_proxy_indicators(df: pd.DataFrame) -> pd.DataFrame:
+    """使用决策时点（pd_close / pd_high / pd_low / pd_volume）重算 today 的指标。
+
+    历史天的指标已经由 compute_indicators 用 full-day OHLC 算好；
+    本函数把每一天的 today-row 用「决策时点截面」**覆盖**重算一遍：
+      - mom_20 / mom_60 / rev_5：用 pd_close 替代 close
+      - ibs / wr14：用 pd_close + pd_high + pd_low
+      - atr14：用 (pd_high, pd_low, pd_close) 的 TR 与 (前 13 日真实 TR) 平均
+      - dollar_vol_20：用 pd_close * pd_volume 替代当日值（其余 19 日不变）
+      - ema9 / ema21 / trend_up：bias 取前一日值（避免 today close 介入 bias）
+    """
+    out = df.copy()
+    if "pd_close" not in out.columns or out["pd_close"].isna().all():
+        # 无分钟数据 → 退化为日线指标
+        return out
+
+    pd_c = out["pd_close"]
+    pd_h = out["pd_high"]
+    pd_l = out["pd_low"]
+    pd_v = out["pd_volume"]
+    valid = pd_c.notna()
+
+    # 动量 / 反转：替换今日分子
+    out.loc[valid, "mom_20"] = pd_c[valid] / out["close"].shift(20)[valid] - 1
+    out.loc[valid, "mom_60"] = pd_c[valid] / out["close"].shift(60)[valid] - 1
+    out.loc[valid, "rev_5"]  = -(pd_c[valid] / out["close"].shift(5)[valid] - 1)
+
+    # IBS / Williams%R 用日内 H/L
+    rng = (pd_h - pd_l).replace(0, np.nan)
+    out.loc[valid, "ibs"] = (pd_c[valid] - pd_l[valid]) / rng[valid]
+    hh14 = pd.concat([out["high"].shift(1).rolling(13).max(), pd_h], axis=1).max(axis=1)
+    ll14 = pd.concat([out["low"].shift(1).rolling(13).min(), pd_l], axis=1).min(axis=1)
+    rng14 = (hh14 - ll14).replace(0, np.nan)
+    out.loc[valid, "wr14"] = (-100 * (hh14 - pd_c) / rng14)[valid]
+
+    # ATR：用决策时点的 TR 替代当日
+    prev_c = out["close"].shift(1)
+    tr_today = pd.concat([(pd_h - pd_l),
+                          (pd_h - prev_c).abs(),
+                          (pd_l - prev_c).abs()], axis=1).max(axis=1)
+    # 简化：take 13-day mean of past TR + today's intraday TR
+    past_tr = pd.concat([
+        (out["high"] - out["low"]),
+        (out["high"] - prev_c).abs(),
+        (out["low"] - prev_c).abs(),
+    ], axis=1).max(axis=1).shift(1)
+    atr_proxy = (past_tr.rolling(13).sum() + tr_today) / 14
+    out.loc[valid, "atr14"] = atr_proxy[valid]
+
+    # dollar_vol_20：替换今日的 close*volume
+    today_dv = (pd_c * pd_v)
+    past_dv = (out["close"] * out["volume"]).shift(1).rolling(19).sum()
+    out.loc[valid, "dollar_vol_20"] = ((past_dv + today_dv) / 20)[valid]
+
+    # ema/trend_up：用前一日（已收盘的）值，避免分钟级偏差
+    out["ema9"] = out["ema9"].shift(1)
+    out["ema21"] = out["ema21"].shift(1)
+    out["trend_up"] = (out["ema9"] > out["ema21"]).astype(float)
+
+    return out
+
+
 def _csrank(s):
     valid = s.dropna()
     if len(valid) < 2:
@@ -227,6 +388,7 @@ class Position:
     stop_price: float
     open_cost: float = 0.0 # 开仓时支付的滑点+平台费(+SEC/TAF 若开空)
     days_held: int = 0
+    last_mark: float = 0.0  # 上次 MTM 参考价（首次为开仓 open；之后为前一日 close）
 
 
 @dataclass
@@ -271,6 +433,14 @@ def _close_cost(cfg: 'Config', shares: float, price: float, side: int) -> float:
 
 def run_backtest(panel: Dict[str, pd.DataFrame], cfg: Config,
                  regime_series: Optional[pd.Series] = None) -> BacktestResult:
+    """
+    执行约定（分钟级 + DECISION_TIME_ET 单一决策点）：
+      Phase A: 09:30 → decision_time，扫描存量持仓的日内止损（gap_open / pd_low / pd_high）
+      Phase B: decision_time，用「日线历史 + 当日截至决策时点」的 panel 生成信号
+               立即在 decision_close 执行：信号反转/max_hold/regime 平仓 + 缺仓位开仓
+      Phase C: decision_time → 16:00，对剩余持仓 MTM 到当日真收盘 (close)
+    实盘对应：每日 decision_time_et 跑一次脚本，按生成的订单立即下单。
+    """
     all_dates = sorted({d for df in panel.values() for d in df.index})
     all_dates = [d for d in all_dates
                  if pd.Timestamp(cfg.start) <= d <= pd.Timestamp(cfg.end)]
@@ -289,8 +459,12 @@ def run_backtest(panel: Dict[str, pd.DataFrame], cfg: Config,
     long_per_pos_base = long_w / cfg.k_long if cfg.k_long > 0 else 0
     short_per_pos_base = short_w / cfg.k_short if cfg.k_short > 0 else 0
 
-    prev_date = None
     v = cfg.verbose_trades
+
+    # 预计算每股的「决策时点 panel」：用 pd_close/pd_high/pd_low/pd_volume 重算今日指标
+    proxy_panel: Dict[str, pd.DataFrame] = {}
+    for sym, df in panel.items():
+        proxy_panel[sym] = compute_proxy_indicators(df)
 
     def _log_open(side, sym, date_, px, stop_px, weight, equity_now, long_n, short_n):
         if not v:
@@ -314,191 +488,206 @@ def run_backtest(panel: Dict[str, pd.DataFrame], cfg: Config,
               f"pnl={pnl_pct*100:+6.2f}% / {_fmt_usd(pnl_usd):>10s}  "
               f"held={days_held}d  ({reason})")
 
+    def _realize_close(sym: str, exit_px: float, reason: str,
+                       exit_date: pd.Timestamp) -> float:
+        """实现一次平仓：扣除现金端 close_cost，记录 trade，返回今日 MTM 贡献(ratio)。"""
+        nonlocal equity
+        pos = positions.pop(sym)
+        close_c = _close_cost(cfg, pos.shares, exit_px, pos.side)
+        equity -= close_c
+        gross_pnl = (exit_px - pos.entry_price) * pos.shares * pos.side
+        pnl_usd = gross_pnl - pos.open_cost - close_c
+        pnl_pct = pnl_usd / (pos.entry_price * pos.shares) if pos.shares > 0 else 0
+        trades.append({
+            "symbol": sym, "side": pos.side,
+            "entry_date": pos.entry_date, "exit_date": exit_date,
+            "entry_price": pos.entry_price, "exit_price": exit_px,
+            "shares": pos.shares, "days_held": pos.days_held,
+            "reason": reason, "pnl_pct": pnl_pct, "pnl_usd": pnl_usd,
+            "costs": pos.open_cost + close_c,
+        })
+        _log_close(pos.side, sym, pos.entry_date, exit_date, pos.entry_price,
+                   exit_px, pos.shares, pos.days_held, reason)
+        if pos.last_mark > 0:
+            return (exit_px / pos.last_mark - 1) * pos.side * pos.weight
+        return 0.0
+
     for i, today in enumerate(all_dates):
-        # 1) 横截面 panel
+        day_pnl = 0.0
+
+        def _row(sym):
+            df = panel[sym]
+            return df.loc[today] if today in df.index else None
+
+        def _proxy_row(sym):
+            df = proxy_panel[sym]
+            return df.loc[today] if today in df.index else None
+
+        # ============ Phase A: 09:30 → 决策时点，扫描存量持仓日内止损 ============
+        for sym in list(positions.keys()):
+            pos = positions[sym]
+            row = _row(sym)
+            if row is None:
+                continue
+            gap_open = row.get("gap_open", np.nan)
+            pd_low = row.get("pd_low", np.nan)
+            pd_high = row.get("pd_high", np.nan)
+            if pd.isna(gap_open):
+                # 无分钟数据回退：跳过日内止损（让 Phase B 信号处理）
+                continue
+
+            stop_hit = False
+            exit_px = np.nan
+            if pos.side == 1:
+                if gap_open <= pos.stop_price:
+                    # 跳空开盘已穿止损 → 按开盘价成交（更差）
+                    stop_hit, exit_px = True, gap_open
+                elif not pd.isna(pd_low) and pd_low <= pos.stop_price:
+                    stop_hit, exit_px = True, pos.stop_price
+            else:  # short
+                if gap_open >= pos.stop_price:
+                    stop_hit, exit_px = True, gap_open
+                elif not pd.isna(pd_high) and pd_high >= pos.stop_price:
+                    stop_hit, exit_px = True, pos.stop_price
+
+            if stop_hit:
+                day_pnl += _realize_close(sym, float(exit_px), "stop_loss", today)
+
+        # ============ Phase B: 决策时点 ============
+        # B.1 构造横截面 panel（用 proxy 指标）
         today_data = {}
         for sym in symbols:
-            df = panel[sym]
-            if today not in df.index:
+            prow = _proxy_row(sym)
+            if prow is None:
                 continue
-            row = df.loc[today]
-            if pd.isna(row.get("mom_60")) or pd.isna(row.get("atr14")):
+            if pd.isna(prow.get("pd_close")) or pd.isna(prow.get("mom_60")) \
+               or pd.isna(prow.get("atr14")):
                 continue
-            if row.get("dollar_vol_20", 0) < cfg.min_dollar_volume:
+            if prow.get("dollar_vol_20", 0) < cfg.min_dollar_volume:
                 continue
-            today_data[sym] = row
+            today_data[sym] = prow
 
-        if len(today_data) < cfg.k_long + cfg.k_short:
-            equity_curve.append(equity)
-            daily_rets.append(0.0)
-            long_counts.append(0)
-            short_counts.append(0)
-            prev_date = today
-            continue
+        has_panel = len(today_data) >= cfg.k_long + cfg.k_short
+        if has_panel:
+            day_panel = pd.DataFrame(today_data).T
 
-        day_panel = pd.DataFrame(today_data).T
+            scores = composite_score(
+                day_panel, mom_w=cfg.mom_weight, bias_w=cfg.bias_weight,
+            ).dropna().sort_values(ascending=False)
+            top_k = set(scores.head(cfg.k_long).index)
+            bot_k = set(scores.tail(cfg.k_short).index) if cfg.k_short > 0 else set()
+            top_2k = set(scores.head(int(cfg.k_long * cfg.hysteresis_mult)).index)
+            bot_2k = (set(scores.tail(int(cfg.k_short * cfg.hysteresis_mult)).index)
+                      if cfg.k_short > 0 else set())
 
-        # 2) 计算今日 P&L
-        day_pnl = 0.0
-        if prev_date is not None:
-            for sym, pos in positions.items():
-                df = panel[sym]
-                if today in df.index and prev_date in df.index:
-                    p_prev = df.loc[prev_date, "close"]
-                    p_today = df.loc[today, "close"]
-                    if p_prev > 0 and not np.isnan(p_today):
-                        ret = (p_today / p_prev - 1) * pos.side
-                        day_pnl += pos.weight * ret
-                pos.days_held += 1
+            allow_long = allow_short = True
+            if cfg.regime_filter and regime_series is not None and today in regime_series.index:
+                up = bool(regime_series.loc[today])
+                allow_long, allow_short = up, not up
+
+            # 波动率目标缩放
+            vol_scale = 1.0
+            if cfg.vol_target_annual > 0 and len(daily_rets) >= cfg.vol_target_lookback:
+                recent = np.asarray(daily_rets[-cfg.vol_target_lookback:])
+                sd = recent.std()
+                if sd > 1e-6:
+                    rv = sd * np.sqrt(252)
+                    vol_scale = float(np.clip(cfg.vol_target_annual / rv,
+                                               cfg.vol_scale_min, cfg.vol_scale_max))
+            long_per_pos = long_per_pos_base * vol_scale
+            short_per_pos = short_per_pos_base * vol_scale
+
+            # B.2 平仓：max_hold / 信号反转 / regime 翻转 → 在 pd_close 立即成交
+            for sym in list(positions.keys()):
+                pos = positions[sym]
+                prow = _proxy_row(sym)
+                if prow is None or pd.isna(prow.get("pd_close")):
+                    continue
+                reason = None
+                if pos.days_held >= cfg.max_hold_days:
+                    reason = "max_hold"
+                elif pos.side == 1 and (sym not in top_2k or not allow_long):
+                    reason = "signal_exit"
+                elif pos.side == -1 and (sym not in bot_2k or not allow_short):
+                    reason = "signal_exit"
+                if reason is None:
+                    continue
+                exit_px = float(prow["pd_close"])
+                day_pnl += _realize_close(sym, exit_px, reason, today)
+
+            # B.3 开仓：缺槽位的 top_k / bot_k 立即在 pd_close 开仓
+            cur_long_n = sum(1 for p in positions.values() if p.side == 1)
+            cur_short_n = sum(1 for p in positions.values() if p.side == -1)
+            held = set(positions.keys())
+
+            if allow_long and cur_long_n < cfg.k_long:
+                for sym in scores.index:
+                    if cur_long_n >= cfg.k_long:
+                        break
+                    if sym not in top_k or sym in held:
+                        continue
+                    prow = day_panel.loc[sym]
+                    px = float(prow["pd_close"]); atr = float(prow["atr14"])
+                    if pd.isna(px) or pd.isna(atr) or px <= 0:
+                        continue
+                    stop_dist = max(cfg.stop_loss_pct * px, cfg.stop_loss_atr_mult * atr)
+                    notional = equity * long_per_pos
+                    shares = notional / px
+                    stop_px = px - stop_dist
+                    open_c = _open_cost(cfg, shares, px, side=1)
+                    equity -= open_c
+                    positions[sym] = Position(
+                        side=1, entry_date=today, entry_price=px,
+                        weight=long_per_pos, shares=shares, stop_price=stop_px,
+                        open_cost=open_c, last_mark=px,
+                    )
+                    cur_long_n += 1
+                    _log_open(1, sym, today, px, stop_px, long_per_pos,
+                              equity, cur_long_n, cur_short_n)
+
+            if allow_short and cur_short_n < cfg.k_short:
+                for sym in scores.index[::-1]:
+                    if cur_short_n >= cfg.k_short:
+                        break
+                    if sym not in bot_k or sym in held:
+                        continue
+                    prow = day_panel.loc[sym]
+                    px = float(prow["pd_close"]); atr = float(prow["atr14"])
+                    if pd.isna(px) or pd.isna(atr) or px <= 0:
+                        continue
+                    stop_dist = max(cfg.stop_loss_pct * px, cfg.stop_loss_atr_mult * atr)
+                    notional = equity * short_per_pos
+                    shares = notional / px
+                    stop_px = px + stop_dist
+                    open_c = _open_cost(cfg, shares, px, side=-1)
+                    equity -= open_c
+                    positions[sym] = Position(
+                        side=-1, entry_date=today, entry_price=px,
+                        weight=short_per_pos, shares=shares, stop_price=stop_px,
+                        open_cost=open_c, last_mark=px,
+                    )
+                    cur_short_n += 1
+                    _log_open(-1, sym, today, px, stop_px, short_per_pos,
+                              equity, cur_long_n, cur_short_n)
+
+        # ============ Phase C: 决策时点 → 16:00，剩余持仓 MTM 到真收盘 ============
+        for sym, pos in positions.items():
+            row = _row(sym)
+            if row is None:
+                continue
+            today_close = row.get("close", np.nan)
+            if pd.isna(today_close) or pos.last_mark <= 0:
+                continue
+            day_pnl += (today_close / pos.last_mark - 1) * pos.side * pos.weight
+            pos.last_mark = float(today_close)
+            pos.days_held += 1
+
         equity *= (1 + day_pnl)
         daily_rets.append(day_pnl)
         equity_curve.append(equity)
 
-        # 波动率目标缩放：基于近 N 日组合日收益的年化波动决定本日新仓 scale
-        vol_scale = 1.0
-        if cfg.vol_target_annual > 0 and len(daily_rets) >= cfg.vol_target_lookback:
-            recent = np.asarray(daily_rets[-cfg.vol_target_lookback:])
-            sd = recent.std()
-            if sd > 1e-6:
-                rv = sd * np.sqrt(252)
-                vol_scale = float(np.clip(cfg.vol_target_annual / rv,
-                                           cfg.vol_scale_min, cfg.vol_scale_max))
-        long_per_pos = long_per_pos_base * vol_scale
-        short_per_pos = short_per_pos_base * vol_scale
-
-        # 3) 止损 / 持有期到期
-        to_close = []
-        for sym, pos in positions.items():
-            df = panel[sym]
-            if today not in df.index:
-                continue
-            today_low = df.loc[today, "low"]
-            today_high = df.loc[today, "high"]
-            today_close = df.loc[today, "close"]
-            triggered = False
-            reason = ""
-            if pos.side == 1 and today_low <= pos.stop_price:
-                triggered, reason = True, "stop_loss"
-            elif pos.side == -1 and today_high >= pos.stop_price:
-                triggered, reason = True, "stop_loss"
-            if pos.days_held >= cfg.max_hold_days:
-                triggered, reason = True, "max_hold"
-            if triggered:
-                to_close.append((sym, today_close, reason))
-        for sym, px, reason in to_close:
-            pos = positions.pop(sym)
-            close_c = _close_cost(cfg, pos.shares, px, pos.side)
-            equity -= close_c
-            gross_pnl = (px - pos.entry_price) * pos.shares * pos.side
-            pnl_usd = gross_pnl - pos.open_cost - close_c
-            pnl_pct = pnl_usd / (pos.entry_price * pos.shares) if pos.shares > 0 else 0
-            trades.append({
-                "symbol": sym, "side": pos.side,
-                "entry_date": pos.entry_date, "exit_date": today,
-                "entry_price": pos.entry_price, "exit_price": px,
-                "shares": pos.shares, "days_held": pos.days_held,
-                "reason": reason, "pnl_pct": pnl_pct, "pnl_usd": pnl_usd,
-                "costs": pos.open_cost + close_c,
-            })
-            _log_close(pos.side, sym, pos.entry_date, today, pos.entry_price,
-                       px, pos.shares, pos.days_held, reason)
-
-        # 4) 重平衡
-        scores = composite_score(
-            day_panel, mom_w=cfg.mom_weight, bias_w=cfg.bias_weight,
-        ).dropna().sort_values(ascending=False)
-        top_k = set(scores.head(cfg.k_long).index)
-        bot_k = set(scores.tail(cfg.k_short).index) if cfg.k_short > 0 else set()
-        top_2k = set(scores.head(int(cfg.k_long * cfg.hysteresis_mult)).index)
-        bot_2k = (set(scores.tail(int(cfg.k_short * cfg.hysteresis_mult)).index)
-                  if cfg.k_short > 0 else set())
-
-        allow_long = allow_short = True
-        if cfg.regime_filter and regime_series is not None and today in regime_series.index:
-            up = bool(regime_series.loc[today])
-            allow_long, allow_short = up, not up
-
-        # 4a) 信号反转出场（hysteresis 边界外）
-        for sym in list(positions.keys()):
-            pos = positions[sym]
-            should_close = ((pos.side == 1 and sym not in top_2k) or
-                            (pos.side == -1 and sym not in bot_2k))
-            if not should_close:
-                continue
-            df = panel[sym]
-            if today in df.index:
-                px = df.loc[today, "close"]
-                close_c = _close_cost(cfg, pos.shares, px, pos.side)
-                equity -= close_c
-                gross_pnl = (px - pos.entry_price) * pos.shares * pos.side
-                pnl_usd = gross_pnl - pos.open_cost - close_c
-                pnl_pct = pnl_usd / (pos.entry_price * pos.shares) if pos.shares > 0 else 0
-                trades.append({
-                    "symbol": sym, "side": pos.side,
-                    "entry_date": pos.entry_date, "exit_date": today,
-                    "entry_price": pos.entry_price, "exit_price": px,
-                    "shares": pos.shares, "days_held": pos.days_held,
-                    "reason": "signal_exit", "pnl_pct": pnl_pct, "pnl_usd": pnl_usd,
-                    "costs": pos.open_cost + close_c,
-                })
-                _log_close(pos.side, sym, pos.entry_date, today, pos.entry_price,
-                           px, pos.shares, pos.days_held, "signal_exit")
-            del positions[sym]
-
-        # 4b) 开新仓
         cur_long_n = sum(1 for p in positions.values() if p.side == 1)
         cur_short_n = sum(1 for p in positions.values() if p.side == -1)
-        need_long = top_k - {s for s, p in positions.items() if p.side == 1} if allow_long else set()
-        need_short = bot_k - {s for s, p in positions.items() if p.side == -1} if allow_short else set()
-
-        for sym in need_long:
-            if cur_long_n >= cfg.k_long:
-                break
-            if sym in positions or sym not in day_panel.index:
-                continue
-            row = day_panel.loc[sym]
-            px = row["close"]; atr = row["atr14"]
-            if pd.isna(px) or pd.isna(atr) or px <= 0:
-                continue
-            stop_dist = max(cfg.stop_loss_pct * px, cfg.stop_loss_atr_mult * atr)
-            notional = equity * long_per_pos
-            shares = notional / px
-            stop_px = px - stop_dist
-            open_c = _open_cost(cfg, shares, px, side=1)
-            equity -= open_c
-            positions[sym] = Position(
-                side=1, entry_date=today, entry_price=px,
-                weight=long_per_pos, shares=shares, stop_price=stop_px,
-                open_cost=open_c,
-            )
-            cur_long_n += 1
-            _log_open(1, sym, today, px, stop_px, long_per_pos,
-                      equity, cur_long_n, cur_short_n)
-
-        for sym in need_short:
-            if cur_short_n >= cfg.k_short:
-                break
-            if sym in positions or sym not in day_panel.index:
-                continue
-            row = day_panel.loc[sym]
-            px = row["close"]; atr = row["atr14"]
-            if pd.isna(px) or pd.isna(atr) or px <= 0:
-                continue
-            stop_dist = max(cfg.stop_loss_pct * px, cfg.stop_loss_atr_mult * atr)
-            notional = equity * short_per_pos
-            shares = notional / px
-            stop_px = px + stop_dist
-            open_c = _open_cost(cfg, shares, px, side=-1)
-            equity -= open_c
-            positions[sym] = Position(
-                side=-1, entry_date=today, entry_price=px,
-                weight=short_per_pos, shares=shares, stop_price=stop_px,
-                open_cost=open_c,
-            )
-            cur_short_n += 1
-            _log_open(-1, sym, today, px, stop_px, short_per_pos,
-                      equity, cur_long_n, cur_short_n)
-
         long_counts.append(cur_long_n)
         short_counts.append(cur_short_n)
 
@@ -508,7 +697,6 @@ def run_backtest(panel: Dict[str, pd.DataFrame], cfg: Config,
             print(f"  [{today.strftime('%Y-%m-%d')}] equity={_fmt_usd(equity)}  "
                   f"L({len(longs)}): {','.join(longs)}  "
                   f"S({len(shorts)}): {','.join(shorts)}")
-        prev_date = today
 
     idx = pd.DatetimeIndex(all_dates)
     return BacktestResult(
@@ -637,9 +825,29 @@ def main():
     print(f"  逐笔打印      {'开启' if cfg.verbose_trades else '关闭'}")
 
     syms = get_universe()
-    print(f"\n[数据] 加载 {len(syms)} 只 NAS100 成分股...")
+    print(f"\n[数据] 加载 {len(syms)} 只 NAS100 成分股日线...")
     data = load_all_data(syms, cfg.start, cfg.end)
-    panel = build_panel(data)
+
+    print(f"\n[数据] 加载分钟级数据 ({cfg.intraday_period}, "
+          f"决策时点 {cfg.decision_time_et} ET)...")
+    intraday = load_all_intraday(list(data.keys()), cfg.start, cfg.end,
+                                  cfg.intraday_period)
+
+    print(f"\n[数据] 聚合分钟数据到决策时点截面...")
+    enhanced: Dict[str, pd.DataFrame] = {}
+    missing_intra = 0
+    for sym, dfd in data.items():
+        intra_df = intraday.get(sym, pd.DataFrame())
+        if len(intra_df) == 0:
+            missing_intra += 1
+        intra_summary = summarize_intraday_per_day(
+            intra_df, cfg.intraday_period, cfg.decision_time_et,
+        )
+        enhanced[sym] = merge_daily_with_intraday(dfd, intra_summary)
+    if missing_intra:
+        print(f"[警告] {missing_intra} 只标的无分钟数据（将无法决策）")
+
+    panel = build_panel(enhanced)
 
     regime_series = None
     if cfg.regime_filter:
