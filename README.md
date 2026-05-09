@@ -19,11 +19,8 @@ pip install -r requirements.txt
 # LONGPORT_APP_SECRET=...
 # LONGPORT_ACCESS_TOKEN=...
 
-# 3. 单次回测（默认 2024-05-08 ~ today）
+# 3. 双模式回测：DAILY (2020+) + INTRADAY (2024-05+) 同时跑
 python backtest.py
-
-# 4. 训练/验证两段式 walk-forward（含小参数网格搜索）
-python walkforward.py
 ```
 
 > 首次运行会拉取约 100 只股票的 2 年 5-min K 线，约 5–10 分钟，之后走本地缓存秒级加载。
@@ -178,33 +175,54 @@ T+1 日：重复上面流程
 
 ---
 
-## 实测结果（2024-05-08 ~ 2026-05-07，约 2 年）
+## 双模式回测
 
-### 单次全期回测（默认参数）
+`backtest.py` 一次同时跑两个：
 
-| 指标 | 策略 | QQQ |
+| 模式 | 起点 | 数据 | 决策/成交价 | 用途 |
+|---|---|---|---|---|
+| **INTRADAY** | 2024-05-08 | 5-min K | 当日 15:50 ET | 模拟实盘可执行的真实回测 |
+| **DAILY** | 2020-01-01 | 日 K | 当日收盘价（理论参考） | 跨牛熊验证策略稳健性（含 2022 熊市） |
+
+DAILY 模式因为没有分钟数据，决策/成交都是同一根日 K 收盘——这相当于"完美信息"基线，主要看年度形态、回撤、是否能扛过熊市，**不用作可执行收益估计**；INTRADAY 模式才代表实盘水平。
+
+---
+
+## 实测结果
+
+### 默认参数（v1：k_long=8, max_hold=20）
+
+| 指标 | INTRADAY (24-05~26-05) | DAILY (20-01~26-05) |
 |---|---|---|
-| 累计收益 | **+91.97%** | +59.66% |
-| CAGR | **38.82%** | 26.59% |
-| Sharpe | **1.40** | 1.22 |
-| 最大回撤 | **-17.26%** | -22.77% |
-| Calmar | **2.25** | — |
-| 总交易 | 312 笔 | — |
-| 总成本 | $47,852（4.79%） | — |
-| 胜率 | 40.4% | — |
+| CAGR | **+40.15%** | +18.83% |
+| Sharpe | **+1.44** | +0.94 |
+| MDD | -17.29% | -39.93% |
 
-### Walk-forward（17m 训练 + 7m 验证）
+DAILY 的 -39.9% MDD 主要来自 2022 熊市，胜在能扛过来；2024 起切换到 INTRADAY 后明显改善。
 
-| 配置 | 训练期 Sharpe | 验证期 Sharpe |
-|---|---|---|
-| DEFAULT | 0.49 | **3.03** |
-| 训练期网格最优 (mom=0.5, hyst=3, k=8) | 1.11 | 2.12 |
+### 参数扫描结论（25 组随机抽样 × DAILY + INTRADAY 双段评分）
 
-**结论**：
-- 验证期 (2025-10 ~ 2026-05) 是强趋势市，所有参数都赚得很多，**+183% CAGR 不可外推**
-- 训练期 (2024-05 ~ 2025-09) 是震荡市，DEFAULT 仅 Sharpe 0.49 —— **更接近长期真实水平**
-- 长期合理预期：**Sharpe ~1.0、CAGR 15-25%**
-- DEFAULT 参数在两段都还行，**保留 DEFAULT 是稳妥选择**
+抽样空间：`k_long ∈ {6,8,10,12,15}`、`mom_weight ∈ {0.5,0.6,0.7,0.8}`、`bias_weight ∈ {0,0.1,0.2,0.3}`、`hysteresis_mult ∈ {2.5,3,4,5,6}`、`stop_loss_pct ∈ {4,5,6,8}%`、`stop_loss_atr_mult ∈ {1,1.5,2,2.5,3}`、`max_hold_days ∈ {20,30,40,60,80,120}`。
+
+排名前 3（按 min(DAILY Sharpe, INTRADAY Sharpe)，越高越说明两段都稳）：
+
+| 组合 | k_long | mom_w | bias_w | hyst | sl% | atr | hold | DAILY CAGR/Sh/MDD | INTRADAY CAGR/Sh/MDD |
+|---|---|---|---|---|---|---|---|---|---|
+| **#20** | 10 | 0.8 | 0.1 | 5.0 | 4 | 2.0 | 80  | +27.3% / 1.15 / -21.0% | +36.9% / 1.35 / -23.9% |
+| **#16** | 10 | 0.8 | 0.3 | 4.0 | 5 | 1.5 | 80  | +25.1% / 1.10 / -24.2% | +40.3% / 1.40 / -21.7% |
+| #17     | 12 | 0.5 | 0.0 | 2.5 | 5 | 1.5 | 120 | +20.9% / 1.08 / -27.3% | +32.3% / 1.38 / -16.4% |
+| DEFAULT |  8 | 0.7 | 0.2 | 4.0 | 5 | 1.5 | 20  | +18.8% / 0.94 / -39.9% | +40.2% / 1.44 / -17.3% |
+
+**关键发现**：
+1. **`max_hold_days=20` 确实偏紧**：放宽到 60-120 时 DAILY 表现普遍更好（少触发 max_hold 强平错杀）。
+2. **k_long 适度增大（10-12）+ hysteresis_mult≥4** 更稳：分散度↑、换手↓、Sharpe ↑。
+3. **mom_weight=0.8、bias_weight 0.1-0.3** 略优于默认 0.7/0.2，但差异有限。
+4. **止损 4-5% + ATR 1.5-2.0** 区间内表现都接近，过宽（8%）反而拖累 INTRADAY。
+5. INTRADAY Sharpe 单项最高 1.63（#13: k=10, mom=0.5, hyst=2.5, sl=6%, atr=2.5, hold=40），但 DAILY Sharpe 只有 1.02——单点过拟合 2024-26 牛市的风险更大。
+
+**推荐**：把 DEFAULT 升级为 **#16 或 #20**，DAILY MDD 从 -40% 收敛到 -24%/-21%，INTRADAY 几乎无损。最保守起见可只改 `MAX_HOLD_DAYS = 60` 这一项，DAILY/INTRADAY 都能受益。
+
+> 25 组随机抽样统计意义有限（且 INTRADAY 区间正好踩在牛市），**Sharpe ~1.0 / CAGR 15-25% 才是长期合理预期**；超过这个数都要警惕 lucky regime。
 
 ---
 
@@ -212,13 +230,11 @@ T+1 日：重复上面流程
 
 ```
 .
-├── backtest.py              # 策略与回测主程序（Phase A/B/C 主循环）
-├── walkforward.py           # 训练/验证两阶段 + 参数网格搜索
-├── nas100_universe.py       # NAS100 成分股清单
+├── backtest.py              # 策略与双模式回测主程序（DAILY + INTRADAY）
+├── nas100_universe.py       # NAS100 成分股清单（含中文名映射）
 ├── longport_api.py          # Longport 日线数据接口
 ├── intraday_api.py          # Longport 分钟级数据接口（含 RTH 过滤、HKT 时区修正）
 ├── daily_cache.py           # 日线 CSV 本地缓存
-├── probe_intraday.py        # 探测 Longport 分钟数据回溯能力（一次性工具）
 ├── data_cache/
 │   ├── daily/               # 日线 CSV
 │   └── intraday/5min/       # 分钟 parquet
@@ -232,9 +248,10 @@ T+1 日：重复上面流程
 ## 关键参数（[`backtest.py`](backtest.py) 顶部）
 
 ```python
-# 回测窗口
-BACKTEST_START = "2024-05-08"        # 起点；分钟数据上限 ~2 年
-BACKTEST_END   = "today"
+# 回测窗口（双模式）
+DAILY_START   = "2020-01-01"         # DAILY 模式起点（跨牛熊参考）
+INTRA_START   = "2024-05-08"         # INTRADAY 模式起点；分钟数据上限 ~2 年
+BACKTEST_END  = "today"
 STARTING_CAPITAL = 1_000_000
 
 # 日内决策（核心新增）

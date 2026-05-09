@@ -35,7 +35,7 @@ BACKTEST_END  = "today"             # 共同终点："today" 或 "YYYY-MM-DD"
 STARTING_CAPITAL = 100000           # 起始本金（美元），仅用于显示与 P&L 美元金额
 
 # ---- 持仓结构 ----
-K_LONG  = 8                         # 最多同时持有的多头数
+K_LONG  = 10                        # 最多同时持有的多头数
 K_SHORT = 0                         # 最多同时持有的空头数（0 = 纯多头，默认）
 LONG_WEIGHT_FRAC = 1.0              # 多头占 gross 的比例；空头占 (1 - 此值)
                                     #   1.0  = 纯多头（默认；建议同时 K_SHORT=0）
@@ -44,9 +44,9 @@ LONG_WEIGHT_FRAC = 1.0              # 多头占 gross 的比例；空头占 (1 -
 GROSS_LEVERAGE = 1.0                # 总毛敞口（long + |short|）
 
 # ---- 信号聚合 ----
-MOM_WEIGHT  = 0.7                   # 动量信号权重；反转 = 1 - 此值
-                                    # NAS100 趋势市场实验显示 0.7 显著优于 0.5
-BIAS_WEIGHT = 0.2                   # EMA9/21 趋势 bias 系数
+MOM_WEIGHT  = 0.8                   # 动量信号权重；反转 = 1 - 此值
+                                    # NAS100 趋势市场实验显示 0.7-0.8 优于 0.5
+BIAS_WEIGHT = 0.3                   # EMA9/21 趋势 bias 系数
 
 # ---- Hysteresis 与持仓维持 ----
 HYSTERESIS_MULT = 4.0               # 持仓需 score 退出 top/bottom (mult * K) 才平仓
@@ -55,7 +55,7 @@ HYSTERESIS_MULT = 4.0               # 持仓需 score 退出 top/bottom (mult * 
 # ---- 风控 ----
 STOP_LOSS_PCT      = 0.05           # 个股止损百分比下限
 STOP_LOSS_ATR_MULT = 1.5            # 个股止损 ATR 倍数；实际止损 = max(pct, ATR mult)
-MAX_HOLD_DAYS      = 20             # 最大持仓天数
+MAX_HOLD_DAYS      = 80             # 最大持仓天数（参数扫描显示 60-120 优于 20）
 MIN_DOLLAR_VOLUME  = 5e7            # 流动性过滤：20D 平均成交额下限（美元）
 
 # ---- 大盘 regime 过滤 ----
