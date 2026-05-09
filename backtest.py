@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-NAS100 短中线策略回测
+美股横截面动量 / 反转选股回测（默认池子 = NAS100 ∪ S&P 500，~516 只）
 
 策略简介：
-- 池子：NAS100 成分股，每日按 20D 平均成交额过滤 ≥ $50M
+- 池子：NAS100 ∪ S&P 500 静态成分（[`universe.py`](universe.py)），每日按 20D 平均成交额过滤 ≥ $50M
 - 信号：动量 (mom_20/mom_60) + 反转 (IBS / Williams%R / rev_5)，rank 化聚合
 - 入场：横截面 composite 分数 top K_LONG 做多
-- 出场：止损（max(5%, 1.5×ATR)）/ 持仓 20 日到期 / 信号退出 hysteresis 带（4×K）
+- 出场：止损（max(5%, 1.5×ATR)）/ 持仓 MAX_HOLD_DAYS 到期 / 信号退出 hysteresis 带（4×K）
 - 大盘 regime 过滤：仅 SPY > 200DMA 时开新多头
 - 波动率目标仓位：按近 20D 组合波动反向缩放仓位（高波动减仓、低波动加仓）
 - 交易成本：Longport 美股平台费 $0.005/股 (min $1) + SEC 0.0000278% + TAF $0.000166/股
