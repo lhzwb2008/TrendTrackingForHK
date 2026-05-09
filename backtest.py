@@ -24,10 +24,15 @@ from __future__ import annotations
 # ============================================================================
 
 # ---- 回测区间与本金 ----
-BACKTEST_START = "2024-05-08"      # 回测起点；股票在该日之前未上市的，从其上市日起参与
-                                    # 注意：Longport 分钟 K 仅回溯 ~2 年；早于此无法做日内决策
-BACKTEST_END   = "today"            # "today" 或 "YYYY-MM-DD"
-STARTING_CAPITAL = 100000       # 起始本金（美元），仅用于显示与 P&L 美元金额
+# 默认运行模式：同时跑两份回测对照
+#   1) DAILY 模式（用纯日 K，T 收盘信号 → T+1 开盘成交）
+#       覆盖跨牛熊的长周期，论证策略稳健性，但日内止损精度受限
+#   2) INTRADAY 模式（用 5min K + DECISION_TIME_ET 决策点）
+#       仅回溯 ~2 年（Longport 分钟数据上限），但与实盘成交逻辑完全一致
+DAILY_START   = "2020-01-01"        # 长周期日 K 回测起点
+INTRA_START   = "2024-05-08"        # 分钟级回测起点（受 Longport 分钟数据上限制约）
+BACKTEST_END  = "today"             # 共同终点："today" 或 "YYYY-MM-DD"
+STARTING_CAPITAL = 100000           # 起始本金（美元），仅用于显示与 P&L 美元金额
 
 # ---- 持仓结构 ----
 K_LONG  = 8                         # 最多同时持有的多头数
@@ -78,7 +83,7 @@ DECISION_TIME_ET = "15:50"          # 美东时间 HH:MM；决策与成交时点
                                     # 注意：分钟数据 Longport 仅回溯 ~2 年
 
 # ---- 输出 ----
-VERBOSE_TRADES = True               # 控制台打印每一笔交易的开/平仓
+VERBOSE_TRADES = False              # True 时打印每一笔交易的开/平仓（默认关闭，盈/亏 Top 仍会展示）
 PRINT_DAILY_POSITIONS = False       # True 时每日打印当前持仓快照（很啰嗦，调试用）
 
 # ============================================================================
@@ -99,7 +104,7 @@ from intraday_api import (
     fetch_intraday_bars, filter_rth, to_et,
     PERIOD_MINUTES, parse_decision_time,
 )
-from nas100_universe import get_universe
+from nas100_universe import get_universe, label as sym_label
 
 
 @dataclass
@@ -134,6 +139,7 @@ class Config:
     decision_time_et: str = DECISION_TIME_ET
     verbose_trades: bool = VERBOSE_TRADES
     print_daily_positions: bool = PRINT_DAILY_POSITIONS
+    mode: str = "intraday"          # "intraday" or "daily"，仅用于日志显示
 
 
 # ---------------- 数据加载 ----------------
@@ -356,6 +362,50 @@ def compute_proxy_indicators(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def build_intraday_enhanced_panel(daily_data: Dict[str, pd.DataFrame],
+                                   intraday: Dict[str, pd.DataFrame],
+                                   period_label: str,
+                                   decision_time_et: str) -> Dict[str, pd.DataFrame]:
+    """构造 INTRADAY 模式的 panel：日 K + 分钟决策时点截面。"""
+    enhanced: Dict[str, pd.DataFrame] = {}
+    for sym, dfd in daily_data.items():
+        intra_df = intraday.get(sym, pd.DataFrame())
+        intra_summary = summarize_intraday_per_day(
+            intra_df, period_label, decision_time_et,
+        )
+        enhanced[sym] = merge_daily_with_intraday(dfd, intra_summary)
+    return enhanced
+
+
+def build_daily_panel(daily_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
+    """构造 DAILY 模式的 panel（plan A：T 收盘信号 → T+1 开盘成交）。
+
+    复用与 INTRADAY 完全相同的 Phase A/B/C 引擎，技巧是合成伪 "决策时点截面"：
+      - gap_open / pd_open / pd_close := 当日 open（执行价 = T 当日开盘 = 实盘 T+1 开盘）
+      - pd_high / pd_low / pd_volume   := 当日 high / low / volume（用于全天止损扫描）
+
+    决策信号必须来自「昨日 close」而非「今日 open」，因此在指标侧整体 shift(1)：
+    today 这一行的 mom_20/atr14/... 实际上是 close_{T-1} 时刻能算出的值。
+    """
+    out: Dict[str, pd.DataFrame] = {}
+    indicator_cols = ("ema9", "ema21", "trend_up", "mom_20", "mom_60",
+                      "rev_5", "ibs", "wr14", "atr14", "dollar_vol_20")
+    for sym, dfd in daily_data.items():
+        df = compute_indicators(dfd).copy()
+        # 决策成交价 = 当日 open（即 plan A 中的 T+1 open）
+        df["gap_open"]  = df["open"]
+        df["pd_open"]   = df["open"]
+        df["pd_close"]  = df["open"]
+        df["pd_high"]   = df["high"]
+        df["pd_low"]    = df["low"]
+        df["pd_volume"] = df["volume"]
+        # 信号必须基于昨日（含）已知信息，整体 shift 让 today 的指标 = T-1 close 的指标
+        for col in indicator_cols:
+            df[col] = df[col].shift(1)
+        out[sym] = df
+    return out
+
+
 def _csrank(s):
     valid = s.dropna()
     if len(valid) < 2:
@@ -461,17 +511,20 @@ def run_backtest(panel: Dict[str, pd.DataFrame], cfg: Config,
 
     v = cfg.verbose_trades
 
-    # 预计算每股的「决策时点 panel」：用 pd_close/pd_high/pd_low/pd_volume 重算今日指标
-    proxy_panel: Dict[str, pd.DataFrame] = {}
-    for sym, df in panel.items():
-        proxy_panel[sym] = compute_proxy_indicators(df)
+    # 预计算每股的「决策时点 panel」
+    #   intraday: 用 pd_close/pd_high/pd_low/pd_volume 重算今日指标
+    #   daily:   panel 在 build_daily_panel 里已经把指标 shift(1)，直接复用即可
+    if cfg.mode == "daily":
+        proxy_panel: Dict[str, pd.DataFrame] = panel
+    else:
+        proxy_panel = {sym: compute_proxy_indicators(df) for sym, df in panel.items()}
 
     def _log_open(side, sym, date_, px, stop_px, weight, equity_now, long_n, short_n):
         if not v:
             return
         s = "LONG " if side == 1 else "SHORT"
         notional = equity_now * weight
-        print(f"  [{date_.strftime('%Y-%m-%d')}] OPEN  {s} {sym:<8} "
+        print(f"  [{date_.strftime('%Y-%m-%d')}] OPEN  {s} {sym_label(sym):<22} "
               f"@ ${px:7.2f}  stop=${stop_px:7.2f}  "
               f"size={_fmt_usd(notional)} ({weight*100:.1f}%)  "
               f"holdings: L{long_n} S{short_n}")
@@ -483,7 +536,7 @@ def run_backtest(panel: Dict[str, pd.DataFrame], cfg: Config,
         pnl_pct = (exit_px / entry_px - 1) * side
         pnl_usd = (exit_px - entry_px) * shares * side
         s = "LONG " if side == 1 else "SHORT"
-        print(f"  [{exit_d.strftime('%Y-%m-%d')}] CLOSE {s} {sym:<8} "
+        print(f"  [{exit_d.strftime('%Y-%m-%d')}] CLOSE {s} {sym_label(sym):<22} "
               f"@ ${exit_px:7.2f}  entry=${entry_px:7.2f}  "
               f"pnl={pnl_pct*100:+6.2f}% / {_fmt_usd(pnl_usd):>10s}  "
               f"held={days_held}d  ({reason})")
@@ -769,13 +822,29 @@ def summarize(result: BacktestResult, cfg: Config,
     return out
 
 
-def print_summary(summary: dict):
+def print_summary(summary: dict, title: str = "回测汇总"):
     print("\n" + "=" * 60)
-    print("                        回测汇总")
+    print(f"                        {title}")
     print("=" * 60)
     for k, v in summary.items():
         print(f"  {k:<20s} {v}")
     print("=" * 60)
+
+
+def print_compare(daily_summary: dict, intra_summary: dict):
+    """并排对比两份回测的核心指标。"""
+    keys = ["区间", "起始本金", "终值", "累计收益", "年化收益(CAGR)",
+            "年化波动", "Sharpe", "最大回撤", "Calmar",
+            "总交易笔数", "总交易成本", "胜率", "平均持仓天数",
+            "基准(QQQ)累计", "基准(QQQ)CAGR", "基准(QQQ)Sharpe", "基准(QQQ)MDD"]
+    print("\n" + "=" * 96)
+    print(f"  {'指标':<18s}  {'DAILY (跨牛熊)':<32s}  {'INTRADAY (实盘对齐)':<32s}")
+    print("=" * 96)
+    for k in keys:
+        v_d = daily_summary.get(k, "-")
+        v_i = intra_summary.get(k, "-")
+        print(f"  {k:<18s}  {str(v_d):<32s}  {str(v_i):<32s}")
+    print("=" * 96)
 
 
 def print_top_trades(trades: List[dict], n: int = 10):
@@ -785,7 +854,7 @@ def print_top_trades(trades: List[dict], n: int = 10):
     print("\n----- 盈利 Top 10 -----")
     for t in sorted_t[:n]:
         s = "LONG " if t["side"] == 1 else "SHORT"
-        print(f"  {t['symbol']:<8} {s} {t['entry_date'].strftime('%Y-%m-%d')} → "
+        print(f"  {sym_label(t['symbol']):<22} {s} {t['entry_date'].strftime('%Y-%m-%d')} → "
               f"{t['exit_date'].strftime('%Y-%m-%d')}  "
               f"${t['entry_price']:7.2f} → ${t['exit_price']:7.2f}  "
               f"{t['pnl_pct']*100:+6.2f}% / {_fmt_usd(t['pnl_usd']):>10s}  "
@@ -793,7 +862,7 @@ def print_top_trades(trades: List[dict], n: int = 10):
     print("\n----- 亏损 Top 10 -----")
     for t in sorted_t[-n:][::-1]:
         s = "LONG " if t["side"] == 1 else "SHORT"
-        print(f"  {t['symbol']:<8} {s} {t['entry_date'].strftime('%Y-%m-%d')} → "
+        print(f"  {sym_label(t['symbol']):<22} {s} {t['entry_date'].strftime('%Y-%m-%d')} → "
               f"{t['exit_date'].strftime('%Y-%m-%d')}  "
               f"${t['entry_price']:7.2f} → ${t['exit_price']:7.2f}  "
               f"{t['pnl_pct']*100:+6.2f}% / {_fmt_usd(t['pnl_usd']):>10s}  "
@@ -802,76 +871,97 @@ def print_top_trades(trades: List[dict], n: int = 10):
 
 # ---------------- 入口 ----------------
 
+def _slice_qqq(qqq_df: pd.DataFrame, start: date, end: date) -> Optional[pd.Series]:
+    if qqq_df is None or len(qqq_df) == 0:
+        return None
+    s = qqq_df.loc[(qqq_df.index >= pd.Timestamp(start)) &
+                    (qqq_df.index <= pd.Timestamp(end)), "close"]
+    return s if len(s) else None
+
+
+def _make_cfg(start: date, end: date, mode: str) -> Config:
+    return Config(start=start, end=end, mode=mode)
+
+
 def main():
     end_date = date.today() if BACKTEST_END == "today" else date.fromisoformat(BACKTEST_END)
-    cfg = Config(start=date.fromisoformat(BACKTEST_START), end=end_date)
+    daily_start = date.fromisoformat(DAILY_START)
+    intra_start = date.fromisoformat(INTRA_START)
+
+    daily_cfg = _make_cfg(daily_start, end_date, "daily")
+    intra_cfg = _make_cfg(intra_start, end_date, "intraday")
 
     print("=" * 60)
-    print(f"  策略配置")
+    print(f"  策略配置（两段对照）")
     print("=" * 60)
-    print(f"  区间          {cfg.start} ~ {cfg.end}")
-    print(f"  起始本金      {_fmt_usd(cfg.starting_capital)}")
-    print(f"  最大持仓      多 {cfg.k_long} / 空 {cfg.k_short}  "
-          f"(共 {cfg.k_long + cfg.k_short} 只)")
-    print(f"  多头权重      {cfg.long_weight_frac*100:.0f}% of gross "
-          f"({cfg.long_weight_frac*cfg.gross_leverage*100/cfg.k_long if cfg.k_long else 0:.1f}%/只)")
-    print(f"  空头权重      {(1-cfg.long_weight_frac)*100:.0f}% of gross "
-          f"({(1-cfg.long_weight_frac)*cfg.gross_leverage*100/cfg.k_short if cfg.k_short else 0:.1f}%/只)")
-    print(f"  动量/反转     {cfg.mom_weight:.2f} / {1-cfg.mom_weight:.2f}")
-    print(f"  Hysteresis    {cfg.hysteresis_mult}x K")
-    print(f"  止损          max({cfg.stop_loss_pct*100:.0f}%, {cfg.stop_loss_atr_mult}×ATR14)")
-    print(f"  最大持仓天    {cfg.max_hold_days}")
-    print(f"  Regime过滤    {'开启' if cfg.regime_filter else '关闭'}")
-    print(f"  逐笔打印      {'开启' if cfg.verbose_trades else '关闭'}")
+    print(f"  DAILY   区间   {daily_cfg.start} ~ {daily_cfg.end}  "
+          f"(plan A: T 收盘信号 → T+1 开盘成交，跨牛熊但日内止损精度受限)")
+    print(f"  INTRA   区间   {intra_cfg.start} ~ {intra_cfg.end}  "
+          f"(分钟级 {intra_cfg.intraday_period} + {intra_cfg.decision_time_et} ET 决策，与实盘一致)")
+    print(f"  起始本金       {_fmt_usd(daily_cfg.starting_capital)}")
+    print(f"  最大持仓       多 {daily_cfg.k_long} / 空 {daily_cfg.k_short}")
+    print(f"  动量/反转      {daily_cfg.mom_weight:.2f} / {1-daily_cfg.mom_weight:.2f}")
+    print(f"  Hysteresis     {daily_cfg.hysteresis_mult}x K")
+    print(f"  止损           max({daily_cfg.stop_loss_pct*100:.0f}%, "
+          f"{daily_cfg.stop_loss_atr_mult}×ATR14)")
+    print(f"  最大持仓天     {daily_cfg.max_hold_days}")
+    print(f"  Regime过滤     {'开启' if daily_cfg.regime_filter else '关闭'}")
+    print(f"  逐笔打印       {'开启' if daily_cfg.verbose_trades else '关闭（默认）'}")
 
     syms = get_universe()
-    print(f"\n[数据] 加载 {len(syms)} 只 NAS100 成分股日线...")
-    data = load_all_data(syms, cfg.start, cfg.end)
 
-    print(f"\n[数据] 加载分钟级数据 ({cfg.intraday_period}, "
-          f"决策时点 {cfg.decision_time_et} ET)...")
-    intraday = load_all_intraday(list(data.keys()), cfg.start, cfg.end,
-                                  cfg.intraday_period)
+    # ---------- 数据加载（按更长的 daily 区间一次性加载，intraday 只覆盖近 2 年） ----------
+    print(f"\n[数据] 加载 {len(syms)} 只 NAS100 成分股日线 ({daily_cfg.start} ~ {daily_cfg.end})...")
+    data = load_all_data(syms, daily_cfg.start, daily_cfg.end)
 
-    print(f"\n[数据] 聚合分钟数据到决策时点截面...")
-    enhanced: Dict[str, pd.DataFrame] = {}
-    missing_intra = 0
-    for sym, dfd in data.items():
-        intra_df = intraday.get(sym, pd.DataFrame())
-        if len(intra_df) == 0:
-            missing_intra += 1
-        intra_summary = summarize_intraday_per_day(
-            intra_df, cfg.intraday_period, cfg.decision_time_et,
-        )
-        enhanced[sym] = merge_daily_with_intraday(dfd, intra_summary)
+    print(f"\n[数据] 加载分钟级数据 ({intra_cfg.intraday_period}, 区间 "
+          f"{intra_cfg.start} ~ {intra_cfg.end}, 决策时点 {intra_cfg.decision_time_et} ET)...")
+    intraday = load_all_intraday(list(data.keys()), intra_cfg.start, intra_cfg.end,
+                                  intra_cfg.intraday_period)
+    missing_intra = sum(1 for s in data.keys() if len(intraday.get(s, pd.DataFrame())) == 0)
     if missing_intra:
-        print(f"[警告] {missing_intra} 只标的无分钟数据（将无法决策）")
+        print(f"[警告] {missing_intra} 只标的无分钟数据（将无法在 INTRADAY 模式决策）")
 
-    panel = build_panel(enhanced)
+    # ---------- 构造两份 panel ----------
+    print(f"\n[数据] 构造 DAILY panel（指标整体 shift(1) + 成交价 = 当日 open）...")
+    daily_panel = build_daily_panel(data)
 
-    regime_series = None
-    if cfg.regime_filter:
-        spy_df = fetch_daily_bars("SPY.US", cfg.start - timedelta(days=400), cfg.end,
-                                   log_cache=False)
-        spy_close = spy_df["close"]
-        regime_series = (spy_close > spy_close.rolling(200).mean())
-        up_days = int(regime_series.sum())
-        print(f"[regime] SPY 200DMA：{up_days}/{len(regime_series)} 日上行")
+    print(f"[数据] 构造 INTRADAY panel（聚合分钟数据到决策时点截面）...")
+    intra_enhanced = build_intraday_enhanced_panel(
+        data, intraday, intra_cfg.intraday_period, intra_cfg.decision_time_et,
+    )
+    intra_panel = build_panel(intra_enhanced)
 
-    if cfg.verbose_trades:
-        print("\n----- 交易明细 -----")
-    result = run_backtest(panel, cfg, regime_series=regime_series)
+    # ---------- regime + benchmark ----------
+    spy_df = fetch_daily_bars("SPY.US",
+                               daily_cfg.start - timedelta(days=400),
+                               daily_cfg.end, log_cache=False)
+    spy_close = spy_df["close"]
+    regime_series = (spy_close > spy_close.rolling(200).mean())
+    up_days = int(regime_series.sum())
+    print(f"[regime] SPY 200DMA：{up_days}/{len(regime_series)} 日上行")
 
-    qqq_df = fetch_daily_bars("QQQ.US", cfg.start - timedelta(days=10), cfg.end,
-                               log_cache=False)
-    qqq = qqq_df.loc[
-        (qqq_df.index >= pd.Timestamp(cfg.start)) & (qqq_df.index <= pd.Timestamp(cfg.end)),
-        "close",
-    ] if len(qqq_df) else None
+    qqq_df = fetch_daily_bars("QQQ.US",
+                               daily_cfg.start - timedelta(days=10),
+                               daily_cfg.end, log_cache=False)
 
-    summary = summarize(result, cfg, qqq)
-    print_summary(summary)
-    print_top_trades(result.trades)
+    # ---------- 跑两份回测 ----------
+    print(f"\n========== 回测 1/2: DAILY 模式（{daily_cfg.start} ~ {daily_cfg.end}） ==========")
+    daily_result = run_backtest(daily_panel, daily_cfg, regime_series=regime_series)
+    daily_summary = summarize(daily_result, daily_cfg,
+                                _slice_qqq(qqq_df, daily_cfg.start, daily_cfg.end))
+    print_summary(daily_summary, title="DAILY 模式（跨牛熊参考）")
+    print_top_trades(daily_result.trades)
+
+    print(f"\n========== 回测 2/2: INTRADAY 模式（{intra_cfg.start} ~ {intra_cfg.end}） ==========")
+    intra_result = run_backtest(intra_panel, intra_cfg, regime_series=regime_series)
+    intra_summary = summarize(intra_result, intra_cfg,
+                                _slice_qqq(qqq_df, intra_cfg.start, intra_cfg.end))
+    print_summary(intra_summary, title="INTRADAY 模式（实盘对齐）")
+    print_top_trades(intra_result.trades)
+
+    # ---------- 并排对比 ----------
+    print_compare(daily_summary, intra_summary)
 
 
 if __name__ == "__main__":
