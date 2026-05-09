@@ -378,30 +378,28 @@ def build_intraday_enhanced_panel(daily_data: Dict[str, pd.DataFrame],
 
 
 def build_daily_panel(daily_data: Dict[str, pd.DataFrame]) -> Dict[str, pd.DataFrame]:
-    """构造 DAILY 模式的 panel（plan A：T 收盘信号 → T+1 开盘成交）。
+    """构造 DAILY 模式的 panel（**参考基准**：今日收盘信号 + 今日收盘成交）。
 
-    复用与 INTRADAY 完全相同的 Phase A/B/C 引擎，技巧是合成伪 "决策时点截面"：
-      - gap_open / pd_open / pd_close := 当日 open（执行价 = T 当日开盘 = 实盘 T+1 开盘）
-      - pd_high / pd_low / pd_volume   := 当日 high / low / volume（用于全天止损扫描）
+    DAILY 模式仅作跨牛熊压力测试的参考，不可实盘（实盘里你拿到 close 时已经收盘）。
+    设计上故意允许 look-ahead，使其与 INTRADAY 的对比仅剩 2 个差异：
+      1. 决策时点：DAILY=16:00 真收盘 vs INTRADAY=15:50（10 分钟差）
+      2. 止损精度：DAILY 用日 K 全天 high/low vs INTRADAY 用 5min K（细节级别差）
 
-    决策信号必须来自「昨日 close」而非「今日 open」，因此在指标侧整体 shift(1)：
-    today 这一行的 mom_20/atr14/... 实际上是 close_{T-1} 时刻能算出的值。
+    伪决策时点截面：
+      - pd_close      := 当日 close（=信号基准价 + 执行价）
+      - gap_open      := 当日 open（用于 Phase A 跳空止损检测）
+      - pd_high/pd_low := 当日 high/low（全天止损扫描）
+      - 指标不 shift：直接用 compute_indicators 的当日值
     """
     out: Dict[str, pd.DataFrame] = {}
-    indicator_cols = ("ema9", "ema21", "trend_up", "mom_20", "mom_60",
-                      "rev_5", "ibs", "wr14", "atr14", "dollar_vol_20")
     for sym, dfd in daily_data.items():
         df = compute_indicators(dfd).copy()
-        # 决策成交价 = 当日 open（即 plan A 中的 T+1 open）
         df["gap_open"]  = df["open"]
         df["pd_open"]   = df["open"]
-        df["pd_close"]  = df["open"]
+        df["pd_close"]  = df["close"]
         df["pd_high"]   = df["high"]
         df["pd_low"]    = df["low"]
         df["pd_volume"] = df["volume"]
-        # 信号必须基于昨日（含）已知信息，整体 shift 让 today 的指标 = T-1 close 的指标
-        for col in indicator_cols:
-            df[col] = df[col].shift(1)
         out[sym] = df
     return out
 
@@ -831,6 +829,50 @@ def print_summary(summary: dict, title: str = "回测汇总"):
     print("=" * 60)
 
 
+def _yearly_stats(result: BacktestResult) -> Dict[int, dict]:
+    """按自然年聚合：收益、最大回撤、Sharpe、平仓笔数。"""
+    eq = result.equity
+    rets = result.daily_returns.dropna()
+    out: Dict[int, dict] = {}
+    for y, r in rets.groupby(rets.index.year):
+        eq_y = eq.loc[eq.index.year == y]
+        dd = (eq_y / eq_y.cummax() - 1).min() if len(eq_y) else 0.0
+        sd = r.std()
+        out[int(y)] = {
+            "ret":    float((1 + r).prod() - 1) * 100,
+            "mdd":    float(dd) * 100,
+            "sharpe": float(r.mean() * 252 / (sd * np.sqrt(252))) if sd > 1e-12 else 0.0,
+            "trades": sum(1 for t in result.trades
+                          if pd.Timestamp(t["exit_date"]).year == y),
+        }
+    return out
+
+
+def print_yearly_comparison(daily_result: BacktestResult,
+                             intra_result: BacktestResult) -> None:
+    """逐年打印 DAILY vs INTRADAY 对比。短周期无数据年份留空。"""
+    d = _yearly_stats(daily_result)
+    i = _yearly_stats(intra_result)
+    years = sorted(d.keys() | i.keys())
+
+    print("\n" + "=" * 84)
+    print("  逐年对比（DAILY 跨牛熊 / INTRADAY 实盘对齐；短周期未覆盖的年份留空）")
+    print("=" * 84)
+    print(f"  {'年份':<6}{'收益%':>20}{'最大回撤%':>22}{'Sharpe':>18}{'平仓笔数':>16}")
+    print(f"  {'':<6}{'Dly / Int':>20}{'Dly / Int':>22}{'Dly / Int':>18}{'Dly / Int':>16}")
+    print("-" * 84)
+    for y in years:
+        a = d.get(y); b = i.get(y)
+        def f(x, key, fmt):
+            return f"{x[key]:{fmt}}" if x else "  --  "
+        print(f"  {y:<6}"
+              f"{f(a,'ret','+8.2f')} / {f(b,'ret','+8.2f')}"
+              f"  {f(a,'mdd','+8.2f')} / {f(b,'mdd','+8.2f')}"
+              f"  {f(a,'sharpe','+6.2f')} / {f(b,'sharpe','+6.2f')}"
+              f"  {f(a,'trades','>5')} / {f(b,'trades','>5')}")
+    print("=" * 84)
+
+
 def print_compare(daily_summary: dict, intra_summary: dict):
     """并排对比两份回测的核心指标。"""
     keys = ["区间", "起始本金", "终值", "累计收益", "年化收益(CAGR)",
@@ -895,7 +937,7 @@ def main():
     print(f"  策略配置（两段对照）")
     print("=" * 60)
     print(f"  DAILY   区间   {daily_cfg.start} ~ {daily_cfg.end}  "
-          f"(plan A: T 收盘信号 → T+1 开盘成交，跨牛熊但日内止损精度受限)")
+          f"(参考基准: 当日 close 信号 + close 成交，跨牛熊压力测试，不可实盘)")
     print(f"  INTRA   区间   {intra_cfg.start} ~ {intra_cfg.end}  "
           f"(分钟级 {intra_cfg.intraday_period} + {intra_cfg.decision_time_et} ET 决策，与实盘一致)")
     print(f"  起始本金       {_fmt_usd(daily_cfg.starting_capital)}")
@@ -923,7 +965,7 @@ def main():
         print(f"[警告] {missing_intra} 只标的无分钟数据（将无法在 INTRADAY 模式决策）")
 
     # ---------- 构造两份 panel ----------
-    print(f"\n[数据] 构造 DAILY panel（指标整体 shift(1) + 成交价 = 当日 open）...")
+    print(f"\n[数据] 构造 DAILY panel（信号 + 成交价均 = 当日 close，参考基准）...")
     daily_panel = build_daily_panel(data)
 
     print(f"[数据] 构造 INTRADAY panel（聚合分钟数据到决策时点截面）...")
@@ -960,8 +1002,9 @@ def main():
     print_summary(intra_summary, title="INTRADAY 模式（实盘对齐）")
     print_top_trades(intra_result.trades)
 
-    # ---------- 并排对比 ----------
+    # ---------- 并排对比 + 自然年分项 ----------
     print_compare(daily_summary, intra_summary)
+    print_yearly_comparison(daily_result, intra_result)
 
 
 if __name__ == "__main__":
