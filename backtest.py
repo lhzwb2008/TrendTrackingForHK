@@ -104,7 +104,7 @@ from intraday_api import (
     fetch_intraday_bars, filter_rth, to_et,
     PERIOD_MINUTES, parse_decision_time,
 )
-from nas100_universe import get_universe, label as sym_label
+from universe import get_universe, label as sym_label
 
 
 @dataclass
@@ -953,7 +953,7 @@ def main():
     syms = get_universe()
 
     # ---------- 数据加载（按更长的 daily 区间一次性加载，intraday 只覆盖近 2 年） ----------
-    print(f"\n[数据] 加载 {len(syms)} 只 NAS100 成分股日线 ({daily_cfg.start} ~ {daily_cfg.end})...")
+    print(f"\n[数据] 加载 {len(syms)} 只成分股日线 ({daily_cfg.start} ~ {daily_cfg.end})...")
     data = load_all_data(syms, daily_cfg.start, daily_cfg.end)
 
     print(f"\n[数据] 加载分钟级数据 ({intra_cfg.intraday_period}, 区间 "

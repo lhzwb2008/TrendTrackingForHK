@@ -1,15 +1,15 @@
 # nas100-quant
 
-NAS100 短中线动量策略（**分钟级日内决策**，含 regime 过滤与波动率目标仓位）
+NAS100 横截面动量 / 反转选股策略，**分钟级日内决策**、回测与实盘**完全同时点同逻辑**。
 
-一个基于 NAS100 成分股的横截面打分日频选股回测系统。每个交易日在**美东 15:50** 用「日线历史 + 当日截至 15:50 的分钟数据」计算横截面 composite 分数，挑前 8 名做多，配大盘 regime 过滤与波动率目标仓位，挂止损。回测与实盘**使用同一份决策逻辑、同一个时点**——可直接对接 Longport 实盘。
+每个交易日美东 **15:50** 用「日 K 历史 + 当日截至 15:50 的分钟数据」算横截面 composite 分数，挑前 10 名做多，叠加 SPY 200DMA regime 过滤、波动率目标仓位与 max(5%, 1.5×ATR) 个股止损。回测产生的开/平仓清单可以直接对接 Longport 实盘。
 
 ---
 
 ## 快速开始
 
 ```bash
-# 1. 创建虚拟环境并安装依赖
+# 1. 创建虚拟环境
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
@@ -19,22 +19,24 @@ pip install -r requirements.txt
 # LONGPORT_APP_SECRET=...
 # LONGPORT_ACCESS_TOKEN=...
 
-# 3. 双模式回测：DAILY (2020+) + INTRADAY (2024-05+) 同时跑
+# 3. 双模式回测（DAILY 跨牛熊 + INTRADAY 实盘对齐，一次跑完）
 python backtest.py
 ```
 
-> 首次运行会拉取约 100 只股票的 2 年 5-min K 线，约 5–10 分钟，之后走本地缓存秒级加载。
+> 首次运行需拉 100 只股票 × 2 年 5-min K（约 4M 根 bar），Longport 限速下约 5-10 分钟，之后走本地缓存秒级加载。
 
 ---
 
-## 关键改动（2026-05 版）
+## 双模式回测
 
-之前的版本用日 K 收盘价作为决策与成交价，存在**前瞻偏差**——实盘里你拿到 close 时已经无法下单。本版本切换为：
+`backtest.py` 一次同时跑两个互补的回测：
 
-1. **数据**：日线 + 5-min K（Longport 分钟数据回溯上限 ~2 年，所以默认起点 2024-05-08）
-2. **决策时点**：每天美东 15:50（参数 `DECISION_TIME_ET`），收盘前 10 分钟
-3. **决策价 = 成交价**：用 15:45-15:50 那根 5-min bar 的收盘价。实盘 15:50 跑脚本，2-3 分钟内提交订单完全来得及
-4. **止损**：精确到 5 分钟级别。若日内 `pd_low ≤ stop_price` 则按 `stop_price` 成交；若开盘 `gap_open` 已穿透 stop，则按 `gap_open` 成交（模拟跳空真实损失）
+| 模式 | 区间 | 数据 | 决策 / 成交 | 用途 |
+|---|---|---|---|---|
+| **INTRADAY** | 2024-05-08 ~ today | 5-min K | 当日 15:50 ET（同价） | 与实盘 1:1 对齐，给出可执行收益 |
+| **DAILY** | 2020-01-01 ~ today | 日 K | 当日 close（同价） | 跨牛熊压力测试，含 2022 熊市验证稳健性 |
+
+DAILY 模式因为没有分钟数据，决策点和成交点都用同一根日 K 收盘——这是"完美信息"理论基线，**不可外推为可执行收益**，但年度形态、回撤、能否扛过熊市都是真实的；INTRADAY 才代表实盘能拿到的水平。
 
 ---
 
@@ -42,60 +44,54 @@ python backtest.py
 
 ### 1. 股票池
 
-NAS100 当期成分股共 100 只（[`nas100_universe.py`](nas100_universe.py)）。
-每天动态过滤：20 日平均成交额 ≥ $50M，且当日有完整 OHLC + 分钟数据。
+NAS100 当期成分股共 100 只（[`nas100_universe.py`](nas100_universe.py)）。每天动态过滤：20 日平均成交额 ≥ $50M、当日 OHLC + 分钟数据完整。
 
-### 2. 信号
-
-每只股票每天计算 6 个信号：
+### 2. 信号（每只股票每天 6 个）
 
 | 类别 | 信号 | 含义 |
 |---|---|---|
 | 动量 | `mom_20 = pd_close / close_20d_ago - 1` | 20 日涨幅（分子用决策时点价） |
 | 动量 | `mom_60 = pd_close / close_60d_ago - 1` | 60 日涨幅 |
-| 反转 | `IBS = (pd_close - pd_low) / (pd_high - pd_low)` | 日内位置 |
+| 反转 | `IBS = (pd_close - pd_low) / (pd_high - pd_low)` | 当日相对位置 |
 | 反转 | `Williams%R(14)` | 14 日相对位置 |
 | 反转 | `rev_5 = -(pd_close / close_5d_ago - 1)` | 5 日反向涨幅 |
-| Bias | `EMA9 > EMA21`（用前一日值，避免日内偏差） | 短均线趋势 |
+| Bias | `EMA9 > EMA21`（用前一日值） | 短均线趋势 |
 
-> `pd_close` / `pd_high` / `pd_low` 是当日截至决策时点（默认 15:50）的累计 OHLC，由 5-min bar 聚合而来。
-> 历史日的指标仍用真实日 K 全天值——只有"今天"这一行会用决策时点的"代理值"覆盖重算。
+> `pd_close` / `pd_high` / `pd_low` 是当日 09:30 ~ 决策时点的累计 OHLC，由 5-min bar 聚合而来。历史日的指标用真实日 K 全天值，只有"今天"这一行被决策时点的代理值覆盖重算——彻底消除前瞻偏差。
 
 ### 3. 横截面打分（每日）
 
-每个信号在 100 只股票上做 rank，归一到 [-1, +1]：
+每个信号在股票池里做 rank，归一到 [-1, +1]：
 
 ```
 momentum_block = mean(rank(mom_20), rank(mom_60))
 reversal_block = mean(-rank(IBS), -rank(-Williams%R), rank(rev_5))
 bias           = (trend_up - 0.5) × 2          # ∈ {-1, +1}
-composite      = 0.7 × momentum_block + 0.3 × reversal_block + 0.2 × bias
+composite      = 0.8 × momentum_block + 0.2 × reversal_block + 0.3 × bias
 ```
 
-`composite` 越大越想做多。NAS100 是趋势市场，动量权重 0.7 优于 0.5。
+`composite` 越大越想做多。NAS100 是趋势市场，动量权重 0.8 略优于 0.5/0.7。
 
 ### 4. 选股 + Hysteresis 滞后带
 
-每日按 composite 排序：
+- **新开仓**：composite 进入 top **K_LONG (=10)** 才开
+- **维持持仓**：仍在 top **(HYSTERESIS_MULT × K_LONG) = 40** 内就保留
+- **跌出 top 40 才平仓**
 
-- **新开仓**：composite 进入 top **K_LONG (默认 8)** 才开
-- **维持持仓**：composite 仍在 top **(HYSTERESIS_MULT × K_LONG) = 32** 内就保留
-- **跌出 top 32 才平仓**
-
-这把日均换手从约 50% 降到 8%。`K_SHORT = 0` 时为纯多头（默认）。
+把日均换手从 ~50% 降到 ~8%，显著节省成本。`K_SHORT = 0` 为纯多头（默认）。
 
 ### 5. 大盘 Regime 过滤
 
-`REGIME_FILTER=True` 时，每日计算 SPY 200 日均线：
+每日计算 SPY 200DMA：
 
 - SPY > 200DMA：允许开新多头
-- SPY < 200DMA：暂停开新多头（已持仓继续按信号/止损管理）
+- SPY < 200DMA：暂停开新多头（已持仓继续按信号 / 止损管理）
 
-历史回测显示 2022 熊市该过滤把回撤从 -34.7% 压到 -12.8%。
+历史回测显示 2022 熊市该过滤把组合回撤压到 -11.8%，全年 -6.5%（同期 QQQ -33%）。
 
 ### 6. 波动率目标仓位
 
-`VOL_TARGET_ANNUAL=0.20` 时，按近 20 日组合实际波动调节仓位规模：
+按近 20 日组合实际波动调节仓位规模：
 
 ```
 realized_vol  = std(daily_returns_last_20d) × sqrt(252)
@@ -103,12 +99,12 @@ vol_scale     = clip(0.20 / realized_vol, 0.3, 2.0)
 position_size = (gross / K_LONG) × vol_scale × equity
 ```
 
-高波动期自动减仓最多到 30%，低波动期最多放大到 200%。
+高波动期自动减仓（最多压到 30%），低波动期最多放大到 200%。
 
 ### 7. 风控
 
-- **个股止损**：`stop = entry × (1 - max(5%, 1.5 × ATR14/entry))`（多头；空头对称）
-- **最长持仓**：20 个交易日，到期强平
+- **个股止损**：`stop = entry × (1 - max(5%, 1.5 × ATR14/entry))`，多头；空头对称
+- **最大持仓**：80 个交易日到期强平
 - **三类出场**：
   1. `stop_loss`：日内触发止损（按 `stop_price` 或 `gap_open` 成交）
   2. `max_hold`：到期持仓
@@ -116,9 +112,9 @@ position_size = (gross / K_LONG) × vol_scale × equity
 
 ### 8. 仓位分配
 
-- **总杠杆** `GROSS_LEVERAGE = 1.0`（满仓不加杠杆）
-- **每只权重** = `100% / K_LONG = 12.5%` × `vol_scale`
-- $1M 本金例：每只多头开仓 ≈ $40k–$250k
+- 总杠杆 1.0（满仓不加杠杆）
+- 每只权重 = `100% / 10 = 10%` × `vol_scale`
+- 默认 $100,000 本金：每只多头开仓 ≈ $3k - $20k
 
 ### 9. 交易成本（Longport 美股口径）
 
@@ -128,7 +124,29 @@ position_size = (gross / K_LONG) × vol_scale × equity
 | 平台费 | $0.005/股，每单最低 $1 | 双边 |
 | SEC 费 | 0.0000278% × notional | 仅卖出 |
 | TAF | $0.000166/股，每单最高 $8.3 | 仅卖出 |
-| 滑点 | **5 bps/侧**（默认） | 双边 |
+| 滑点 | 5 bps/侧（默认） | 双边 |
+
+---
+
+## 收益来源（为什么这个策略能赚）
+
+1. **横截面动量**（mom_20 + mom_60，权重 0.8）
+   NAS100 是高 beta 趋势市场，**强者恒强**结构性显著——20/60 日跑赢同侪的股票，下个月平均仍跑赢。这是组合主要的 alpha 来源。
+
+2. **横截面反转作为补丁**（IBS / W%R / 5 日反转，权重 0.2）
+   纯动量在拐点附近吃亏。三个反转因子在动量逻辑之上挑"被错杀的"，对短期回吐起到对冲作用。
+
+3. **EMA Bias 加权**（权重 0.3）
+   只在短均线已经向上的标的里挑——避免抄底正在掉的"低 IBS"。
+
+4. **Regime 过滤防熊市**
+   2022 那种系统性下跌里，NAS100 横截面 alpha 被 beta 完全吞掉。SPY 200DMA 一旦跌破就停止开仓，把单年最差从 -25% 量级压到 -7% 量级。
+
+5. **波动率目标控制回撤**
+   组合 vol 高了自动减仓，能把 max drawdown 收敛到比 buy-and-hold 一半还低。
+
+6. **Hysteresis 减摩擦**
+   横截面排名每天都在抖动，不加滞后带 turnover 50% 起步，年成本 8-12% 直接吞掉一半 alpha。滞后到 4×K 后年成本降到 ~3-5%（INTRADAY 模式实测 2.98%）。
 
 ---
 
@@ -139,90 +157,120 @@ T 日：
   09:30 ET   美股开盘
   ─────── Phase A ───────
   09:30 → 15:50：监控存量持仓
-    ├─ 任一时刻 low ≤ stop（多头）/ high ≥ stop（空头） → 触发止损
-    │   - 一般情况：按 stop_price 成交（GTC stop 限价单）
-    │   - 极端跳空：开盘已穿透 stop → 按 gap_open 成交（市价被动接受）
-    └─ 未触发的持仓继续持有
-  
+    任一时刻 low ≤ stop（多头）/ high ≥ stop（空头） → 触发止损
+      ├─ 一般情况：按 stop_price 成交（GTC stop 限价单）
+      └─ 极端跳空：开盘已穿透 stop → 按 gap_open 成交（被动接受）
+    未触发的持仓继续持有
+
   ─────── Phase B (15:50 决策点) ───────
   15:50 ET   单一决策时点
     1. 用「日 K 历史 + 今日 09:30~15:50 的 5-min 聚合」算 composite
     2. 平仓（在 15:50 价立即成交）：
-       - 持仓满 20 天 → max_hold
-       - 跌出 top 32 → signal_exit
+       - 持仓满 80 天 → max_hold
+       - 跌出 top 40 → signal_exit
        - regime 翻转且持仓方向相反 → signal_exit
     3. 开仓（在 15:50 价立即成交）：
-       - top 8 中尚未持有的标的 → 开多
-       - 同时挂当日及次日的 GTC stop-loss 限价单
-  
+       - top 10 中尚未持有的标的 → 开多
+       - 同步挂当日及次日的 GTC stop-loss 限价单
+
   ─────── Phase C ───────
   15:50 → 16:00：剩余 10 分钟
     存量持仓继续持有，价格波动正常 MTM 至 16:00 真收盘
 
-T+1 日：重复上面流程
+T+1 日：重复
 ```
 
-**实盘对应步骤**：
+**实盘对应**：
 
-1. 服务器配定时任务，每日美东 **15:50** 跑 `python backtest.py`（或专门的实盘单日决策脚本，待加）
-2. 脚本输出今日的开/平仓清单与 stop 价
+1. 服务器配定时任务，每日美东 **15:50** 跑 `python backtest.py`（或单日决策脚本，待加）
+2. 输出今日开 / 平仓清单与 stop 价
 3. 立即通过 Longport `submit_order` 提交：
    - 平仓：限价单贴近 last（10 分钟内成交）
    - 开仓：限价单贴近 last + 同步挂 GTC stop-loss
-4. 16:00 前确认所有订单已成交；未成的 IOC 可以追到收盘
-
-回测和实盘**完全用同一份决策逻辑、同一个时点**，没有任何"未来函数"。
+4. 16:00 前确认全部成交；未成的可 IOC 追到收盘
 
 ---
 
-## 双模式回测
+## 实测结果（默认参数，起始本金 $100,000）
 
-`backtest.py` 一次同时跑两个：
+### 总览
 
-| 模式 | 起点 | 数据 | 决策/成交价 | 用途 |
-|---|---|---|---|---|
-| **INTRADAY** | 2024-05-08 | 5-min K | 当日 15:50 ET | 模拟实盘可执行的真实回测 |
-| **DAILY** | 2020-01-01 | 日 K | 当日收盘价（理论参考） | 跨牛熊验证策略稳健性（含 2022 熊市） |
-
-DAILY 模式因为没有分钟数据，决策/成交都是同一根日 K 收盘——这相当于"完美信息"基线，主要看年度形态、回撤、是否能扛过熊市，**不用作可执行收益估计**；INTRADAY 模式才代表实盘水平。
-
----
-
-## 实测结果
-
-### 默认参数（v1：k_long=8, max_hold=20）
-
-| 指标 | INTRADAY (24-05~26-05) | DAILY (20-01~26-05) |
+| 指标 | DAILY 2020-01 ~ 2026-05 (6.33y) | INTRADAY 2024-05 ~ 2026-05 (1.99y) |
 |---|---|---|
-| CAGR | **+40.15%** | +18.83% |
-| Sharpe | **+1.44** | +0.94 |
-| MDD | -17.29% | -39.93% |
+| 累计收益 | **+323.33%** ($323,331) | **+96.19%** ($96,188) |
+| 年化收益 (CAGR) | **25.59%** | **40.26%** |
+| Sharpe | **1.12** | **1.40** |
+| 最大回撤 | **-24.22%** | **-21.71%** |
+| Calmar | 1.06 | 1.85 |
+| 胜率 | 38.9% | 33.9% |
+| 平均持仓天数 | 16.9 | 18.7 |
+| 总交易笔数 | 733 | 230 |
+| 总交易成本 | $14,414 (14.41%) | $2,983 (2.98%) |
+| QQQ 同期 CAGR | 21.44% | 28.02% |
+| QQQ 同期 Sharpe | 0.90 | 1.27 |
+| QQQ 同期 MDD | -35.12% | -22.77% |
 
-DAILY 的 -39.9% MDD 主要来自 2022 熊市，胜在能扛过来；2024 起切换到 INTRADAY 后明显改善。
+策略相对 QQQ：DAILY 段 **超额 80pp 累计 / +0.22 Sharpe / 回撤少 11pp**；INTRADAY 段 **超额 33pp 累计 / +0.13 Sharpe / 回撤接近**。
 
-### 参数扫描结论（25 组随机抽样 × DAILY + INTRADAY 双段评分）
+### 逐年分解（DAILY 模式覆盖完整 2020-2026）
 
-抽样空间：`k_long ∈ {6,8,10,12,15}`、`mom_weight ∈ {0.5,0.6,0.7,0.8}`、`bias_weight ∈ {0,0.1,0.2,0.3}`、`hysteresis_mult ∈ {2.5,3,4,5,6}`、`stop_loss_pct ∈ {4,5,6,8}%`、`stop_loss_atr_mult ∈ {1,1.5,2,2.5,3}`、`max_hold_days ∈ {20,30,40,60,80,120}`。
+| 年份 | 收益 | MDD | Sharpe | 平仓笔数 | 备注 |
+|---|---|---|---|---|---|
+| 2020 | +31.19% | -18.02% | 1.20 | 125 | 疫情 V 反弹 |
+| 2021 | +30.63% | -15.75% | 1.15 | 120 | 牛市 |
+| **2022** | **-6.50%** | **-11.80%** | -0.54 | 94 | **熊市，QQQ -33%；regime 过滤救命** |
+| 2023 | +15.99% | -18.49% | 0.79 | 135 | 震荡反弹 |
+| 2024 | +15.02% | -16.52% | 0.69 | 110 | 全年震荡 |
+| 2025 | +16.11% | -14.60% | 0.84 | 111 | 缓涨 |
+| 2026 YTD | +86.44% | -12.52% | 4.03 | 38 | 强趋势，**不可外推** |
 
-排名前 3（按 min(DAILY Sharpe, INTRADAY Sharpe)，越高越说明两段都稳）：
+> 2026 YTD 的 Sharpe 4.03 是 lucky regime（trending market），长期合理预期仍是 **Sharpe ~1.0、CAGR 15-25%**。
 
-| 组合 | k_long | mom_w | bias_w | hyst | sl% | atr | hold | DAILY CAGR/Sh/MDD | INTRADAY CAGR/Sh/MDD |
-|---|---|---|---|---|---|---|---|---|---|
-| **#20** | 10 | 0.8 | 0.1 | 5.0 | 4 | 2.0 | 80  | +27.3% / 1.15 / -21.0% | +36.9% / 1.35 / -23.9% |
-| **#16** | 10 | 0.8 | 0.3 | 4.0 | 5 | 1.5 | 80  | +25.1% / 1.10 / -24.2% | +40.3% / 1.40 / -21.7% |
-| #17     | 12 | 0.5 | 0.0 | 2.5 | 5 | 1.5 | 120 | +20.9% / 1.08 / -27.3% | +32.3% / 1.38 / -16.4% |
-| DEFAULT |  8 | 0.7 | 0.2 | 4.0 | 5 | 1.5 | 20  | +18.8% / 0.94 / -39.9% | +40.2% / 1.44 / -17.3% |
+---
 
-**关键发现**：
-1. **`max_hold_days=20` 确实偏紧**：放宽到 60-120 时 DAILY 表现普遍更好（少触发 max_hold 强平错杀）。
-2. **k_long 适度增大（10-12）+ hysteresis_mult≥4** 更稳：分散度↑、换手↓、Sharpe ↑。
-3. **mom_weight=0.8、bias_weight 0.1-0.3** 略优于默认 0.7/0.2，但差异有限。
-4. **止损 4-5% + ATR 1.5-2.0** 区间内表现都接近，过宽（8%）反而拖累 INTRADAY。
-5. INTRADAY Sharpe 单项最高 1.63（#13: k=10, mom=0.5, hyst=2.5, sl=6%, atr=2.5, hold=40），但 DAILY Sharpe 只有 1.02——单点过拟合 2024-26 牛市的风险更大。
+## 关键参数（[`backtest.py`](backtest.py) 顶部）
 
-**推荐**：把 DEFAULT 升级为 **#16 或 #20**，DAILY MDD 从 -40% 收敛到 -24%/-21%，INTRADAY 几乎无损。最保守起见可只改 `MAX_HOLD_DAYS = 60` 这一项，DAILY/INTRADAY 都能受益。
+```python
+# 回测窗口（双模式）
+DAILY_START   = "2020-01-01"         # DAILY 起点（跨牛熊参考）
+INTRA_START   = "2024-05-08"         # INTRADAY 起点（分钟数据上限 ~2 年）
+BACKTEST_END  = "today"
+STARTING_CAPITAL = 100_000
 
-> 25 组随机抽样统计意义有限（且 INTRADAY 区间正好踩在牛市），**Sharpe ~1.0 / CAGR 15-25% 才是长期合理预期**；超过这个数都要警惕 lucky regime。
+# 日内决策
+INTRADAY_PERIOD  = "5min"            # 1min / 5min / 15min / 30min / 60min
+DECISION_TIME_ET = "15:50"           # 美东 HH:MM；收盘前 10 分钟
+
+# 持仓结构
+K_LONG  = 10
+K_SHORT = 0
+GROSS_LEVERAGE = 1.0
+
+# 信号
+MOM_WEIGHT  = 0.8
+BIAS_WEIGHT = 0.3
+
+# 滞后带 / 风控
+HYSTERESIS_MULT     = 4.0
+STOP_LOSS_PCT       = 0.05
+STOP_LOSS_ATR_MULT  = 1.5
+MAX_HOLD_DAYS       = 80
+MIN_DOLLAR_VOLUME   = 5e7
+REGIME_FILTER       = True
+
+# 波动率目标
+VOL_TARGET_ANNUAL   = 0.20
+VOL_TARGET_LOOKBACK = 20
+VOL_SCALE_MIN       = 0.3
+VOL_SCALE_MAX       = 2.0
+
+# 成本（Longport 美股口径）
+ENABLE_COSTS         = True
+PLATFORM_FEE_PER_SHARE = 0.005
+SEC_FEE_RATE           = 0.0000278
+TAF_PER_SHARE          = 0.000166
+SLIPPAGE_BPS           = 5.0
+```
 
 ---
 
@@ -230,10 +278,10 @@ DAILY 的 -39.9% MDD 主要来自 2022 熊市，胜在能扛过来；2024 起切
 
 ```
 .
-├── backtest.py              # 策略与双模式回测主程序（DAILY + INTRADAY）
+├── backtest.py              # 策略与双模式回测主程序（Phase A/B/C 主循环）
 ├── nas100_universe.py       # NAS100 成分股清单（含中文名映射）
-├── longport_api.py          # Longport 日线数据接口
-├── intraday_api.py          # Longport 分钟级数据接口（含 RTH 过滤、HKT 时区修正）
+├── longport_api.py          # Longport 日线接口（含线程安全单例 + 重试）
+├── intraday_api.py          # Longport 分钟级接口（RTH 过滤、HKT 时区修正、反向分页）
 ├── daily_cache.py           # 日线 CSV 本地缓存
 ├── data_cache/
 │   ├── daily/               # 日线 CSV
@@ -245,61 +293,65 @@ DAILY 的 -39.9% MDD 主要来自 2022 熊市，胜在能扛过来；2024 起切
 
 ---
 
-## 关键参数（[`backtest.py`](backtest.py) 顶部）
+## 已知限制与注意事项
 
-```python
-# 回测窗口（双模式）
-DAILY_START   = "2020-01-01"         # DAILY 模式起点（跨牛熊参考）
-INTRA_START   = "2024-05-08"         # INTRADAY 模式起点；分钟数据上限 ~2 年
-BACKTEST_END  = "today"
-STARTING_CAPITAL = 1_000_000
-
-# 日内决策（核心新增）
-INTRADAY_PERIOD  = "5min"            # 1min / 5min / 15min / 30min / 60min
-DECISION_TIME_ET = "15:50"           # 美东时间 HH:MM；收盘前留 10 分钟下单
-
-# 持仓结构
-K_LONG  = 8
-K_SHORT = 0
-LONG_WEIGHT_FRAC = 1.0
-GROSS_LEVERAGE = 1.0
-
-# 信号
-MOM_WEIGHT  = 0.7                    # 动量/反转权重
-BIAS_WEIGHT = 0.2
-
-# 滞后带
-HYSTERESIS_MULT = 4.0                # 跌出 top (4×K) 才平仓
-
-# 风控
-STOP_LOSS_PCT      = 0.05
-STOP_LOSS_ATR_MULT = 1.5
-MAX_HOLD_DAYS      = 20
-MIN_DOLLAR_VOLUME  = 5e7
-REGIME_FILTER      = True
-
-# 波动率目标
-VOL_TARGET_ANNUAL   = 0.20
-VOL_TARGET_LOOKBACK = 20
-VOL_SCALE_MIN       = 0.3
-VOL_SCALE_MAX       = 2.0
-
-# 成本
-ENABLE_COSTS           = True
-PLATFORM_FEE_PER_SHARE = 0.005
-PLATFORM_FEE_MIN       = 1.0
-SEC_FEE_RATE           = 0.0000278
-TAF_PER_SHARE          = 0.000166
-TAF_MAX_PER_ORDER      = 8.3
-SLIPPAGE_BPS           = 5.0
-```
+1. **分钟数据上限 ~2 年**：Longport `history_candlesticks_by_date` 在分钟周期下仅回溯到约 2024-05；早于此抛 `301600 out of minute kline begin date`。这就是 INTRADAY 模式只能从 2024-05-08 起的原因。
+2. **时区**：Longport 分钟 K 的 timestamp 是 **HKT (UTC+8) 但 tz-naive**，[`intraday_api.py`](intraday_api.py) 会显式 localize 后转 UTC，再转 ET 过滤 RTH。已封装好。
+3. **首次拉数据耗时**：100 股 × 2 年 × 5min ≈ 4M 根 bar，受限速约 5-10 分钟；之后增量缓存只补当天最新数据。
+4. **Sharpe / CAGR 的合理预期**：当前 DAILY 1.12 / 25.6%、INTRADAY 1.40 / 40.3%。长期合理预期 **Sharpe ~1.0、CAGR 15-25%**；显著超过此区间的样本（如 2026 YTD）大概率是 lucky regime，不要外推。
+5. **止损价的近似性**：`pd_low ≤ stop_price` 触发后假设按 `stop_price` 成交。极端波动股票（如 LCID、TTD）实盘可能比回测亏更多，gap-down 已用 `gap_open` 兜底。
+6. **幸存者偏差**：当前用 NAS100 静态成分股，未做 point-in-time 还原，理论上 2020 年的回测里包含了那时还不在 NAS100 的票。要彻底干掉这一偏差需要接成分股历史变更日，工程上代价较高，目前没做。
 
 ---
 
-## 已知限制与注意事项
+## 附录：研究历程与已尝试的实验
 
-1. **分钟数据上限 2 年**：Longport `history_candlesticks_by_date` 在分钟周期下仅回溯到约 2024-05；早于此抛 `301600 out of minute kline begin date`。
-2. **时区**：Longport 分钟 K 的 timestamp 是 **HKT (UTC+8) 但 tz-naive**，[`intraday_api.py`](intraday_api.py) 会显式 localize 后转 UTC，再转 ET 过滤 RTH。已封装好，无需关心。
-3. **首次拉数据耗时**：100 股 × 2 年 × 5min ≈ 4M 根 bar，Longport 限速下首次约 5-10 分钟。之后增量缓存只补当天最新数据。
-4. **Sharpe 训练→验证 大幅提升**不代表泛化好，反而要警惕 lucky regime：验证期是趋势市，长期 Sharpe ~1.0 才是合理预期。
-5. **止损价的近似性**：`pd_low ≤ stop_price` 触发后假设按 `stop_price` 成交。极端波动股票（如 LCID、TTD）实盘可能比回测亏更多，gap-down 已用 `gap_open` 兜底。
+主要决策都通过实测验证过，下面把过程压缩成一段，方便回顾：
+
+### A. 决策时点扫描（INTRADAY 模式）
+
+扫描 `DECISION_TIME_ET ∈ {10:00, 11:00, …, 15:55}`，看哪个时点 INTRADAY Sharpe 最高：
+
+- 12:00 出现峰值（Sharpe ~1.63），但 11:00、13:00 邻近点也能到 1.5+
+- 不同时点结果有 ±0.2 Sharpe 的抖动，明显有过拟合 2 年样本的成分
+- **最终选 15:50**：实盘可执行（收盘前 10 分钟下单完全来得及）+ 信号最新鲜，性能并不弱
+
+### B. 参数随机扫描（25 组 × DAILY + INTRADAY 双段评分）
+
+抽样空间：`k_long ∈ {6,8,10,12,15}`、`mom_weight ∈ {0.5,0.6,0.7,0.8}`、`bias_weight ∈ {0,0.1,0.2,0.3}`、`hysteresis_mult ∈ {2.5,3,4,5,6}`、`stop_loss_pct ∈ {4,5,6,8}%`、`stop_loss_atr_mult ∈ {1,1.5,2,2.5,3}`、`max_hold_days ∈ {20,30,40,60,80,120}`。
+
+按 `min(DAILY Sharpe, INTRADAY Sharpe)` 排名前 3：
+
+| k_long | mom_w | bias_w | hyst | sl% | atr | hold | DAILY Sh / MDD | INTRA Sh / MDD |
+|---|---|---|---|---|---|---|---|---|
+| **10** | **0.8** | **0.1** | **5.0** | **4** | **2.0** | **80** | 1.15 / -21% | 1.35 / -24% |
+| **10** | **0.8** | **0.3** | **4.0** | **5** | **1.5** | **80** | 1.10 / -24% | 1.40 / -22% |
+| 12 | 0.5 | 0.0 | 2.5 | 5 | 1.5 | 120 | 1.08 / -27% | 1.38 / -16% |
+
+**关键结论**：
+- 旧默认 `MAX_HOLD_DAYS=20` 偏紧，放宽到 60-120 显著降低 DAILY MDD（-40% → -24%）
+- `k_long` 适度增大（10-12）+ `hysteresis_mult ≥ 4` 更稳：分散度↑ 换手↓ Sharpe↑
+- `mom_weight 0.8 / bias_weight 0.3` 略优于 0.7 / 0.2，差异有限
+- 最终 DEFAULT 升级为表中第 2 行（k=10, mom=0.8, bias=0.3, hyst=4.0, hold=80）
+
+### C. Universe 扩展实验（NAS100 → NAS100 ∪ S&P 500，518 只）
+
+只跑 DAILY 模式（INTRADAY 拉 500 只 × 2 年分钟数据约 1-2 小时不划算）：
+
+| Universe | CAGR | Sharpe | MDD | 总交易 | 成本 |
+|---|---|---|---|---|---|
+| NAS100 (101) | 25.59% | 1.12 | -24.22% | 733 | 14.4% |
+| **NAS100 ∪ SP500 (518)** | **37.49%** | **1.51** | -25.23% | 1303 | 30.2% |
+
+扩大池子后 Sharpe **+0.39**、CAGR **+12pp**、MDD 仅恶化 1pp。原因是 SP500 里的中盘成长股（CVNA、SMCI、APP、PLTR、SNDK 等）给了更多 outsized winners。代价是换手翻倍，年成本从 14% → 30%（仍能净盈利）。
+
+**当前主线仍用 NAS100**——保守选择，且实测幸存者偏差影响相对可控；若需更激进，可将 [`nas100_universe.py`](nas100_universe.py) 替换为 NAS100 ∪ SP500 即可。
+
+### D. Walk-Forward（已废弃）
+
+早期做过 17m 训练 + 7m 验证两段网格搜索：
+
+- 验证期 (2025-10 ~ 2026-05) 是强趋势市，几乎所有参数都跑出 Sharpe 2-3，没区分度
+- 训练期 (2024-05 ~ 2025-09) 是震荡市，DEFAULT 只 Sharpe 0.49
+
+样本太短，验证期踩到 lucky regime，结果对参数选择几乎没指导价值。后来改用 B 中的"DAILY (6 年) + INTRADAY (2 年) 双段评分"思路，更稳。
