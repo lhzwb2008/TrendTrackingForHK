@@ -39,24 +39,17 @@ STARTING_CAPITAL = 100_000
 #   mode      : "none" / "static" / "rolling_beta"
 #   ratio     : static 模式下 = hedge_notional / long_mv
 #               rolling_beta 模式下 = 乘到估计 beta 上的额外 scale
+# 默认只跑 baseline + 最佳推荐（rolling-beta QQQ 0.5x）。
+# 经过 15 组完整扫描（结果见 PR #1），rolling-beta QQQ 0.5x 是「调平 + 保留 alpha」的最优解：
+#   Sharpe 1.30 → 1.52，CAGR 35.9% → 35.3%（几乎无损），
+#   Beta(QQQ) 0.43 → 0.21（砍半），波动 26.3% → 21.5%
+# 如需做参数扫描，把下方列表替换/扩充为多组 (name, instrument, mode, ratio) 即可。
 HEDGE_VARIANTS = [
-    ("baseline (no hedge)",           None,      "none",          0.0),
-    # 静态对冲扫描（按多头 notional 比例）
-    ("static QQQ 0.3x",               "QQQ.US",  "static",        0.3),
-    ("static QQQ 0.5x",               "QQQ.US",  "static",        0.5),
-    ("static QQQ 0.7x",               "QQQ.US",  "static",        0.7),
-    ("static QQQ 1.0x",               "QQQ.US",  "static",        1.0),
-    ("static SPY 0.3x",               "SPY.US",  "static",        0.3),
-    ("static SPY 0.5x",               "SPY.US",  "static",        0.5),
-    ("static SPY 0.7x",               "SPY.US",  "static",        0.7),
-    ("static SPY 1.0x",               "SPY.US",  "static",        1.0),
-    # 动态 beta 对冲扫描（hedge_factor = ratio × rolling_beta）
-    ("rolling-beta QQQ 0.5x",         "QQQ.US",  "rolling_beta",  0.5),
-    ("rolling-beta QQQ 0.7x",         "QQQ.US",  "rolling_beta",  0.7),
-    ("rolling-beta QQQ 1.0x",         "QQQ.US",  "rolling_beta",  1.0),
-    ("rolling-beta SPY 0.5x",         "SPY.US",  "rolling_beta",  0.5),
-    ("rolling-beta SPY 0.7x",         "SPY.US",  "rolling_beta",  0.7),
-    ("rolling-beta SPY 1.0x",         "SPY.US",  "rolling_beta",  1.0),
+    ("baseline (no hedge)",     None,      "none",          0.0),
+    ("rolling-beta QQQ 0.5x",   "QQQ.US",  "rolling_beta",  0.5),
+    # 候选备选（默认注释；按需打开做对照）：
+    # ("rolling-beta QQQ 1.0x", "QQQ.US",  "rolling_beta",  1.0),    # 严格 zero-beta（市场中性口径）
+    # ("static SPY 0.3x",       "SPY.US",  "static",        0.3),    # 简单不调仓的次佳方案
 ]
 
 # 滚动 beta 估计窗口
