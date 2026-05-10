@@ -41,11 +41,21 @@ STARTING_CAPITAL = 100_000
 #               rolling_beta 模式下 = 乘到估计 beta 上的额外 scale
 HEDGE_VARIANTS = [
     ("baseline (no hedge)",           None,      "none",          0.0),
+    # 静态对冲扫描（按多头 notional 比例）
+    ("static QQQ 0.3x",               "QQQ.US",  "static",        0.3),
     ("static QQQ 0.5x",               "QQQ.US",  "static",        0.5),
+    ("static QQQ 0.7x",               "QQQ.US",  "static",        0.7),
     ("static QQQ 1.0x",               "QQQ.US",  "static",        1.0),
+    ("static SPY 0.3x",               "SPY.US",  "static",        0.3),
     ("static SPY 0.5x",               "SPY.US",  "static",        0.5),
+    ("static SPY 0.7x",               "SPY.US",  "static",        0.7),
     ("static SPY 1.0x",               "SPY.US",  "static",        1.0),
+    # 动态 beta 对冲扫描（hedge_factor = ratio × rolling_beta）
+    ("rolling-beta QQQ 0.5x",         "QQQ.US",  "rolling_beta",  0.5),
+    ("rolling-beta QQQ 0.7x",         "QQQ.US",  "rolling_beta",  0.7),
     ("rolling-beta QQQ 1.0x",         "QQQ.US",  "rolling_beta",  1.0),
+    ("rolling-beta SPY 0.5x",         "SPY.US",  "rolling_beta",  0.5),
+    ("rolling-beta SPY 0.7x",         "SPY.US",  "rolling_beta",  0.7),
     ("rolling-beta SPY 1.0x",         "SPY.US",  "rolling_beta",  1.0),
 ]
 
