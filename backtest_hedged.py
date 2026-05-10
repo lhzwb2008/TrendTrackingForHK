@@ -6,20 +6,24 @@ crossrank 对冲实验：在 DAILY 模式基础上叠加 SPY/QQQ 做空对冲，
 设计要点：
   - 仅 DAILY 模式（日 K，不依赖分钟数据，方便快速实验）
   - 完全复用 backtest.py 的指标计算 / panel 构造 / Phase A-B-C 主循环
-  - 在每个交易日额外维护一笔 benchmark 短头寸（SPY 或 QQQ）：
-      * 每日开始：用昨日 close → 今日 close 给已有空头做 MTM
-      * 每日结束（Phase C 之后）：根据当日多头实际 market value 调整 hedge_short_notional
-        到 target = ratio × beta × long_mv，并为 |delta| 部分计提调仓成本（滑点 +
-        平台费 + 卖出方向的 SEC/TAF）
+  - **两个独立账户**：
+      多头账户：与 backtest.py DAILY 的 baseline 100% 一致 —— 多头交易、笔数、
+              累计 PnL、equity 滚动完全相同，不受对冲影响
+      对冲账户：独立维护 benchmark 短头寸 PnL 与调仓成本
+      总 equity = baseline_equity + 累积对冲 PnL - 累积对冲成本
+    这样保证对冲只是「叠加在原策略之上」，对原策略零干扰。
   - 三种对冲模式：
-      none           : 纯多头基准（与原 backtest.py DAILY 一致，用于复现）
-      static[r]      : 固定 hedge_ratio = r 倍多头 notional
-      rolling_beta   : 动态对冲，beta 用过去 N 日策略 pre-hedge returns 与 benchmark
-                       returns 的协方差/方差估计；首段未到 lookback 时退化为 1.0
+      none           : 纯多头（与原 backtest.py DAILY 完全一致）
+      static[r]      : 固定 hedge_short = r × 多头当日真实市值
+      rolling_beta   : hedge_short = ratio × rolling_beta × 多头当日真实市值
+                       beta 用过去 N 日多头策略 returns 与 benchmark returns 的
+                       协方差/方差估计；首段未到 lookback 时退化为 1.0
+  - 对冲调仓 size 基于 baseline 多头当日真实市值（按当日真收盘价 MTM 后）
+    所以相同多头组合对应同一份对冲规模，不会因对冲而漂移
 
 输出：每个变体的 Sharpe / CAGR / MDD / Calmar / 与基准 QQQ 相关性，再做并排对比。
 
-运行：  python3 backtest_hedged.py
+运行：  python backtest_hedged.py
 """
 
 from __future__ import annotations
@@ -33,23 +37,15 @@ DAILY_START   = "2020-01-01"
 BACKTEST_END  = "today"
 STARTING_CAPITAL = 100_000
 
-# ---- 对冲实验配置 ----
-# 跑哪些变体，列表里每项 = (name, instrument, mode, ratio)
-#   instrument: "QQQ.US" / "SPY.US"
-#   mode      : "none" / "static" / "rolling_beta"
-#   ratio     : static 模式下 = hedge_notional / long_mv
-#               rolling_beta 模式下 = 乘到估计 beta 上的额外 scale
 # 默认只跑 baseline + 最佳推荐（rolling-beta QQQ 0.5x）。
-# 经过 15 组完整扫描（结果见 PR #1），rolling-beta QQQ 0.5x 是「调平 + 保留 alpha」的最优解：
-#   Sharpe 1.30 → 1.52，CAGR 35.9% → 35.3%（几乎无损），
-#   Beta(QQQ) 0.43 → 0.21（砍半），波动 26.3% → 21.5%
-# 如需做参数扫描，把下方列表替换/扩充为多组 (name, instrument, mode, ratio) 即可。
+# 经过完整扫描，rolling-beta QQQ 0.5x 是「调平 + 保留 alpha」的最佳折中。
+# 如需做参数扫描，把列表替换/扩充为多组 (name, instrument, mode, ratio)。
 HEDGE_VARIANTS = [
     ("baseline (no hedge)",     None,      "none",          0.0),
     ("rolling-beta QQQ 0.5x",   "QQQ.US",  "rolling_beta",  0.5),
     # 候选备选（默认注释；按需打开做对照）：
-    # ("rolling-beta QQQ 1.0x", "QQQ.US",  "rolling_beta",  1.0),    # 严格 zero-beta（市场中性口径）
-    # ("static SPY 0.3x",       "SPY.US",  "static",        0.3),    # 简单不调仓的次佳方案
+    # ("rolling-beta QQQ 1.0x", "QQQ.US",  "rolling_beta",  1.0),    # 严格 zero-beta
+    # ("static QQQ 0.5x",       "QQQ.US",  "static",        0.5),    # 简单不动 beta 的对照
 ]
 
 # 滚动 beta 估计窗口
@@ -86,9 +82,10 @@ from backtest import (
     ENABLE_COSTS, PLATFORM_FEE_PER_SHARE, PLATFORM_FEE_MIN,
     SEC_FEE_RATE, TAF_PER_SHARE, TAF_MAX_PER_ORDER, SLIPPAGE_BPS,
     INTRADAY_PERIOD, DECISION_TIME_ET,
+    _yearly_stats as _yearly_stats_basic,
 )
 from longport_api import fetch_daily_bars
-from universe import get_universe
+from universe import get_universe, label as sym_label
 
 
 # ---------------- 对冲配置 / 状态 ----------------
@@ -105,12 +102,38 @@ class HedgeCfg:
 
 
 @dataclass
-class HedgeState:
-    short_notional: float = 0.0    # 当前对冲的市值（始终 ≥ 0；short = -short_notional 美元敞口）
-    last_close: float = 0.0        # 上一次 MTM 时的 benchmark close
-    total_costs: float = 0.0       # 累计调仓成本
-    rebalance_count: int = 0       # 调仓次数（包括首次开仓）
-    pnl_dollars: float = 0.0       # 累计对冲层 PnL（不含调仓成本）
+class StratResult:
+    """baseline 多头层的回测结果（独立于对冲，完全等价于 backtest.py 的 run_backtest DAILY 模式）。"""
+    equity: pd.Series                # 多头层 equity（不含对冲）
+    daily_returns: pd.Series         # 多头层日收益（不含对冲）
+    trades: List[dict]
+    long_count: pd.Series
+    short_count: pd.Series
+    long_mv: pd.Series                # 每日多头实际总市值（按当日真收盘 close MTM 后；用于决定对冲 size）
+
+    def to_basic(self) -> BacktestResult:
+        return BacktestResult(
+            equity=self.equity, daily_returns=self.daily_returns,
+            trades=self.trades, long_count=self.long_count,
+            short_count=self.short_count,
+        )
+
+
+@dataclass
+class HedgeOverlayResult:
+    """对冲 overlay 后的结果（叠加在 baseline 之上）。"""
+    name: str
+    cfg: HedgeCfg
+    # 总 equity 与日 returns（含对冲）
+    equity_total: pd.Series
+    daily_returns_total: pd.Series
+    # 对冲层独立累计 PnL / 成本
+    hedge_pnl_cum: pd.Series          # 累积对冲 PnL（mark-to-market，不含调仓成本）
+    hedge_cost_cum: pd.Series         # 累积对冲调仓成本
+    short_notional: pd.Series         # 每日对冲短头寸大小
+    rebalance_count: int
+    # 每日 hedge ratio 实际值（调仓 size 占当日 long_mv 的比例）
+    effective_factor: pd.Series
 
 
 # ---------------- 工具 ----------------
@@ -118,7 +141,7 @@ class HedgeState:
 def rolling_beta(strat_rets: List[float], bench_rets: List[float],
                  window: int, min_obs: int,
                  clip: Tuple[float, float]) -> float:
-    """用过去 `window` 日的策略 pre-hedge returns 与 benchmark returns 估计 beta。"""
+    """用过去 `window` 日的策略多头 returns 与 benchmark returns 估计 beta。"""
     n = min(len(strat_rets), len(bench_rets))
     if n < min_obs:
         return 1.0
@@ -134,8 +157,7 @@ def rolling_beta(strat_rets: List[float], bench_rets: List[float],
 
 def hedge_rebalance_cost(cfg: 'Config', delta_notional: float,
                           price: float, side_of_trade: int) -> float:
-    """
-    benchmark 调仓成本（绝对值 delta_notional）。
+    """benchmark 调仓成本（绝对值 delta_notional）。
     side_of_trade: +1 = 卖出（增加空头 / 平多）触发 SEC/TAF
                    -1 = 买入（减少空头 / 开多）不触发 SEC/TAF
     """
@@ -151,20 +173,14 @@ def hedge_rebalance_cost(cfg: 'Config', delta_notional: float,
     return cost
 
 
-# ---------------- 带对冲层的回测引擎 ----------------
+# ---------------- baseline 多头回测（与 backtest.py run_backtest DAILY 完全等价，外加 long_mv 记录） ----------------
 
-def run_backtest_hedged(panel: Dict[str, pd.DataFrame], cfg: Config,
-                         hedge_cfg: HedgeCfg,
-                         regime_series: Optional[pd.Series] = None,
-                         bench_close: Optional[pd.Series] = None
-                         ) -> Tuple[BacktestResult, HedgeState, pd.Series]:
+def run_strategy_baseline(panel: Dict[str, pd.DataFrame], cfg: Config,
+                           regime_series: Optional[pd.Series] = None) -> StratResult:
     """
-    在 DAILY 模式上叠加一层 SPY/QQQ 做空对冲。
-    与原 run_backtest 的主体逻辑一致；新增：
-      - 每日开盘前：MTM 已有 hedge 短仓
-      - 每日 Phase C 后：按当日 long_mv 重设 target hedge 并扣调仓成本
-    返回 (BacktestResult, HedgeState, gross_strategy_returns_series)
-    其中 gross_strategy_returns 用来校验 / 对比 pre-hedge 的策略表现。
+    DAILY 模式 baseline 多头回测；逻辑与 backtest.py 中 run_backtest 等价
+    （cfg.mode 视作 'daily'，proxy_panel = panel），额外返回每日多头总市值
+    long_mv（按当日真收盘 close MTM 后），供对冲 overlay 使用。
     """
     all_dates = sorted({d for df in panel.values() for d in df.index})
     all_dates = [d for d in all_dates
@@ -177,6 +193,7 @@ def run_backtest_hedged(panel: Dict[str, pd.DataFrame], cfg: Config,
     equity = float(cfg.starting_capital)
     equity_curve, daily_rets = [], []
     long_counts, short_counts = [], []
+    long_mv_curve: List[float] = []
     trades: List[dict] = []
 
     long_w = cfg.gross_leverage * cfg.long_weight_frac
@@ -184,13 +201,15 @@ def run_backtest_hedged(panel: Dict[str, pd.DataFrame], cfg: Config,
     long_per_pos_base = long_w / cfg.k_long if cfg.k_long > 0 else 0
     short_per_pos_base = short_w / cfg.k_short if cfg.k_short > 0 else 0
 
-    # DAILY 模式 panel 已经是 build_daily_panel 的结果，本身就是 proxy 指标
     proxy_panel = panel
 
-    # ---- 对冲层状态 ----
-    hstate = HedgeState()
-    bench_returns_history: List[float] = []
-    strat_pre_hedge_returns: List[float] = []
+    def _row(sym, today):
+        df = panel[sym]
+        return df.loc[today] if today in df.index else None
+
+    def _proxy_row(sym, today):
+        df = proxy_panel[sym]
+        return df.loc[today] if today in df.index else None
 
     def _realize_close(sym: str, exit_px: float, reason: str,
                        exit_date: pd.Timestamp) -> float:
@@ -214,33 +233,12 @@ def run_backtest_hedged(panel: Dict[str, pd.DataFrame], cfg: Config,
         return 0.0
 
     for i, today in enumerate(all_dates):
-        day_pnl_strat = 0.0     # 策略本身（多头层）的当日 ratio
-        day_pnl_hedge = 0.0     # 对冲层当日 ratio
-
-        def _row(sym):
-            df = panel[sym]
-            return df.loc[today] if today in df.index else None
-
-        def _proxy_row(sym):
-            df = proxy_panel[sym]
-            return df.loc[today] if today in df.index else None
-
-        # ============ 对冲 MTM（用昨 close → 今 close）============
-        bench_close_today = (float(bench_close.loc[today])
-                             if bench_close is not None and today in bench_close.index
-                             else None)
-        bench_ret_today = 0.0
-        if bench_close_today is not None and hstate.last_close > 0:
-            bench_ret_today = bench_close_today / hstate.last_close - 1
-            if hstate.short_notional > 0:
-                pnl_dollar = -hstate.short_notional * bench_ret_today
-                day_pnl_hedge += pnl_dollar / equity
-                hstate.pnl_dollars += pnl_dollar
+        day_pnl = 0.0
 
         # ============ Phase A: 日内止损扫描 ============
         for sym in list(positions.keys()):
             pos = positions[sym]
-            row = _row(sym)
+            row = _row(sym, today)
             if row is None:
                 continue
             gap_open = row.get("gap_open", np.nan)
@@ -261,12 +259,12 @@ def run_backtest_hedged(panel: Dict[str, pd.DataFrame], cfg: Config,
                 elif not pd.isna(pd_high) and pd_high >= pos.stop_price:
                     stop_hit, exit_px = True, pos.stop_price
             if stop_hit:
-                day_pnl_strat += _realize_close(sym, float(exit_px), "stop_loss", today)
+                day_pnl += _realize_close(sym, float(exit_px), "stop_loss", today)
 
         # ============ Phase B: 决策时点 ============
         today_data = {}
         for sym in symbols:
-            prow = _proxy_row(sym)
+            prow = _proxy_row(sym, today)
             if prow is None:
                 continue
             if pd.isna(prow.get("pd_close")) or pd.isna(prow.get("mom_60")) \
@@ -293,10 +291,9 @@ def run_backtest_hedged(panel: Dict[str, pd.DataFrame], cfg: Config,
                 up = bool(regime_series.loc[today])
                 allow_long, allow_short = up, not up
 
-            # 波动率目标缩放（用策略 pre-hedge 的 returns）
             vol_scale = 1.0
-            if cfg.vol_target_annual > 0 and len(strat_pre_hedge_returns) >= cfg.vol_target_lookback:
-                recent = np.asarray(strat_pre_hedge_returns[-cfg.vol_target_lookback:])
+            if cfg.vol_target_annual > 0 and len(daily_rets) >= cfg.vol_target_lookback:
+                recent = np.asarray(daily_rets[-cfg.vol_target_lookback:])
                 sd = recent.std()
                 if sd > 1e-6:
                     rv = sd * np.sqrt(252)
@@ -305,10 +302,9 @@ def run_backtest_hedged(panel: Dict[str, pd.DataFrame], cfg: Config,
             long_per_pos = long_per_pos_base * vol_scale
             short_per_pos = short_per_pos_base * vol_scale
 
-            # B.2 信号/regime/max_hold 平仓
             for sym in list(positions.keys()):
                 pos = positions[sym]
-                prow = _proxy_row(sym)
+                prow = _proxy_row(sym, today)
                 if prow is None or pd.isna(prow.get("pd_close")):
                     continue
                 reason = None
@@ -321,9 +317,8 @@ def run_backtest_hedged(panel: Dict[str, pd.DataFrame], cfg: Config,
                 if reason is None:
                     continue
                 exit_px = float(prow["pd_close"])
-                day_pnl_strat += _realize_close(sym, exit_px, reason, today)
+                day_pnl += _realize_close(sym, exit_px, reason, today)
 
-            # B.3 开仓
             cur_long_n = sum(1 for p in positions.values() if p.side == 1)
             cur_short_n = sum(1 for p in positions.values() if p.side == -1)
             held = set(positions.keys())
@@ -376,61 +371,23 @@ def run_backtest_hedged(panel: Dict[str, pd.DataFrame], cfg: Config,
 
         # ============ Phase C: MTM 到当日真收盘 ============
         long_mv_today = 0.0
-        short_mv_today = 0.0
         for sym, pos in positions.items():
-            row = _row(sym)
+            row = _row(sym, today)
             if row is None:
                 continue
             today_close = row.get("close", np.nan)
             if pd.isna(today_close) or pos.last_mark <= 0:
                 continue
-            day_pnl_strat += (today_close / pos.last_mark - 1) * pos.side * pos.weight
+            day_pnl += (today_close / pos.last_mark - 1) * pos.side * pos.weight
             pos.last_mark = float(today_close)
             pos.days_held += 1
-            mv = pos.shares * float(today_close)
             if pos.side == 1:
-                long_mv_today += mv
-            else:
-                short_mv_today += mv
+                long_mv_today += pos.shares * float(today_close)
 
-        # ============ 综合 day_pnl 并更新 equity ============
-        day_pnl = day_pnl_strat + day_pnl_hedge
         equity *= (1 + day_pnl)
         daily_rets.append(day_pnl)
         equity_curve.append(equity)
-
-        # 记录用于 beta 估计的 returns 与 benchmark returns（必须同步）
-        if bench_close_today is not None:
-            strat_pre_hedge_returns.append(day_pnl_strat)
-            bench_returns_history.append(bench_ret_today)
-
-        # ============ 调整 hedge 至今日目标 ============
-        if hedge_cfg.mode != "none" and bench_close_today is not None and bench_close_today > 0:
-            if hedge_cfg.mode == "static":
-                hedge_factor = hedge_cfg.ratio
-            elif hedge_cfg.mode == "rolling_beta":
-                beta = rolling_beta(
-                    strat_pre_hedge_returns, bench_returns_history,
-                    hedge_cfg.beta_lookback, hedge_cfg.beta_min_obs,
-                    hedge_cfg.beta_clip,
-                )
-                hedge_factor = max(0.0, hedge_cfg.ratio * beta)
-            else:
-                hedge_factor = 0.0
-            target_short = hedge_factor * long_mv_today
-            delta = target_short - hstate.short_notional
-            if abs(delta) > 1e-6:
-                # delta>0: 增加空头 = 卖出（触发 SEC/TAF）
-                # delta<0: 减少空头 = 买入回补
-                side_of_trade = 1 if delta > 0 else -1
-                cost = hedge_rebalance_cost(cfg, abs(delta), bench_close_today, side_of_trade)
-                equity -= cost
-                hstate.total_costs += cost
-                hstate.rebalance_count += 1
-            hstate.short_notional = max(0.0, target_short)
-            hstate.last_close = bench_close_today
-        elif bench_close_today is not None:
-            hstate.last_close = bench_close_today
+        long_mv_curve.append(long_mv_today)
 
         cur_long_n = sum(1 for p in positions.values() if p.side == 1)
         cur_short_n = sum(1 for p in positions.values() if p.side == -1)
@@ -438,42 +395,135 @@ def run_backtest_hedged(panel: Dict[str, pd.DataFrame], cfg: Config,
         short_counts.append(cur_short_n)
 
     idx = pd.DatetimeIndex(all_dates)
-    result = BacktestResult(
+    return StratResult(
         equity=pd.Series(equity_curve, index=idx, name="equity"),
         daily_returns=pd.Series(daily_rets, index=idx, name="ret"),
         trades=trades,
         long_count=pd.Series(long_counts, index=idx),
         short_count=pd.Series(short_counts, index=idx),
+        long_mv=pd.Series(long_mv_curve, index=idx, name="long_mv"),
     )
-    # 把 pre-hedge 策略 returns 也返回，便于 beta / 相关性后处理
-    pre_hedge_idx = idx[:len(strat_pre_hedge_returns)]
-    pre_hedge_series = pd.Series(strat_pre_hedge_returns, index=pre_hedge_idx,
-                                  name="strat_pre_hedge_ret")
-    return result, hstate, pre_hedge_series
+
+
+# ---------------- 对冲 overlay（纯后处理） ----------------
+
+def simulate_hedge_overlay(strat: StratResult, bench_close: pd.Series,
+                            hedge_cfg: HedgeCfg, cfg: Config) -> HedgeOverlayResult:
+    """
+    在 baseline 多头层之上叠加 benchmark 短头寸 overlay。
+    注意：不修改 baseline equity 滚动；只在最终结果里把对冲 PnL/成本叠加上去。
+    每日：
+      1) 用昨日 close → 今日 close 给已有空仓做 MTM（计入 hedge_pnl）
+      2) 算 target = ratio × beta × baseline.long_mv[today]，调仓到 target
+         （rolling_beta 用 baseline.daily_returns 与 benchmark returns 的协方差）
+      3) 调仓的 |delta| 部分按卖空 / 平空方向计提滑点 + 平台费 + （卖空时）SEC/TAF
+    """
+    idx = strat.equity.index
+    bench_close_aligned = bench_close.reindex(idx).ffill()
+
+    short_notional = 0.0
+    last_bench_close: Optional[float] = None
+    cum_pnl = 0.0
+    cum_cost = 0.0
+    rebal_count = 0
+
+    cum_pnl_curve, cum_cost_curve = [], []
+    short_notional_curve, factor_curve = [], []
+
+    strat_rets_history: List[float] = []
+    bench_rets_history: List[float] = []
+
+    for i, today in enumerate(idx):
+        bench_close_today = bench_close_aligned.iloc[i]
+
+        # 1) MTM
+        bench_ret_today = 0.0
+        if last_bench_close is not None and not np.isnan(bench_close_today) and last_bench_close > 0:
+            bench_ret_today = bench_close_today / last_bench_close - 1
+            if short_notional > 0:
+                pnl = -short_notional * bench_ret_today
+                cum_pnl += pnl
+
+        # 把当日 strat returns 与 bench returns 入 history（用于 beta 估计）
+        strat_rets_history.append(float(strat.daily_returns.iloc[i]))
+        bench_rets_history.append(bench_ret_today if last_bench_close is not None else 0.0)
+
+        # 2) 调仓 target
+        long_mv_today = float(strat.long_mv.iloc[i])
+        if hedge_cfg.mode == "static":
+            hedge_factor = hedge_cfg.ratio
+        elif hedge_cfg.mode == "rolling_beta":
+            beta = rolling_beta(
+                strat_rets_history, bench_rets_history,
+                hedge_cfg.beta_lookback, hedge_cfg.beta_min_obs,
+                hedge_cfg.beta_clip,
+            )
+            hedge_factor = max(0.0, hedge_cfg.ratio * beta)
+        else:
+            hedge_factor = 0.0
+
+        target_short = hedge_factor * long_mv_today
+        if not np.isnan(bench_close_today) and bench_close_today > 0:
+            delta = target_short - short_notional
+            if abs(delta) > 1e-6:
+                side = 1 if delta > 0 else -1
+                cost = hedge_rebalance_cost(cfg, abs(delta), bench_close_today, side)
+                cum_cost += cost
+                rebal_count += 1
+            short_notional = max(0.0, target_short)
+            last_bench_close = float(bench_close_today)
+
+        cum_pnl_curve.append(cum_pnl)
+        cum_cost_curve.append(cum_cost)
+        short_notional_curve.append(short_notional)
+        factor_curve.append(hedge_factor)
+
+    cum_pnl_s = pd.Series(cum_pnl_curve, index=idx, name="hedge_pnl_cum")
+    cum_cost_s = pd.Series(cum_cost_curve, index=idx, name="hedge_cost_cum")
+    short_s = pd.Series(short_notional_curve, index=idx, name="short_notional")
+    factor_s = pd.Series(factor_curve, index=idx, name="effective_factor")
+
+    # 总 equity = baseline equity + 累积 hedge PnL - 累积 hedge cost
+    equity_total = strat.equity + cum_pnl_s - cum_cost_s
+    equity_total.name = "equity_total"
+    daily_rets_total = equity_total.pct_change().fillna(
+        equity_total.iloc[0] / cfg.starting_capital - 1)
+
+    return HedgeOverlayResult(
+        name=hedge_cfg.name, cfg=hedge_cfg,
+        equity_total=equity_total, daily_returns_total=daily_rets_total,
+        hedge_pnl_cum=cum_pnl_s, hedge_cost_cum=cum_cost_s,
+        short_notional=short_s, rebalance_count=rebal_count,
+        effective_factor=factor_s,
+    )
 
 
 # ---------------- 评估辅助 ----------------
 
-def _ann_stats(rets: pd.Series) -> Dict[str, float]:
+def _ann_stats(rets: pd.Series, equity: Optional[pd.Series] = None,
+               starting: Optional[float] = None) -> Dict[str, float]:
     rets = rets.dropna()
     if len(rets) == 0:
         return dict(cum=0.0, cagr=0.0, vol=0.0, sharpe=0.0, mdd=0.0, calmar=0.0)
-    eq = (1 + rets).cumprod()
-    cum = float(eq.iloc[-1] - 1)
+    if equity is not None and starting is not None:
+        cum = float(equity.iloc[-1] / starting - 1)
+    else:
+        eq_imp = (1 + rets).cumprod()
+        cum = float(eq_imp.iloc[-1] - 1)
     years = len(rets) / 252.0
-    cagr = (eq.iloc[-1]) ** (1 / years) - 1 if years > 0 else 0.0
+    cagr = (1 + cum) ** (1 / years) - 1 if years > 0 else 0.0
     sd = rets.std(ddof=0)
     vol = float(sd * np.sqrt(252))
     sharpe = float(rets.mean() * 252 / vol) if vol > 1e-9 else 0.0
-    dd = (eq / eq.cummax() - 1).min()
+    eq_for_dd = equity if equity is not None else (1 + rets).cumprod()
+    dd = (eq_for_dd / eq_for_dd.cummax() - 1).min()
     mdd = float(dd) if not np.isnan(dd) else 0.0
     calmar = (cagr / abs(mdd)) if mdd < 0 else 0.0
     return dict(cum=cum, cagr=cagr, vol=vol, sharpe=sharpe, mdd=mdd, calmar=calmar)
 
 
 def _corr_with(rets: pd.Series, bench_rets: pd.Series) -> float:
-    rets = rets.dropna()
-    bench_rets = bench_rets.dropna()
+    rets = rets.dropna(); bench_rets = bench_rets.dropna()
     common = rets.index.intersection(bench_rets.index)
     if len(common) < 30:
         return float("nan")
@@ -496,16 +546,18 @@ def _empirical_beta(rets: pd.Series, bench_rets: pd.Series) -> float:
     return float(np.cov(a, b, ddof=0)[0, 1] / var_b)
 
 
-def print_variant_summary(name: str, result: BacktestResult, hstate: HedgeState,
-                           cfg: Config, qqq_close: pd.Series):
-    s = _ann_stats(result.daily_returns)
+def print_variant_summary(name: str, equity_total: pd.Series, daily_rets: pd.Series,
+                           strat: StratResult, hedge_pnl: float, hedge_cost: float,
+                           rebal_count: int, cfg: Config, qqq_close: pd.Series,
+                           bench_label: str = ""):
+    s = _ann_stats(daily_rets, equity=equity_total, starting=cfg.starting_capital)
     qqq_rets = qqq_close.pct_change()
-    corr_qqq = _corr_with(result.daily_returns, qqq_rets)
-    beta_qqq = _empirical_beta(result.daily_returns, qqq_rets)
-    n_trades = len(result.trades)
-    long_pnl = sum(t["pnl_usd"] for t in result.trades if t["side"] == 1)
-    total_strat_costs = sum(t.get("costs", 0) for t in result.trades)
-    total_costs = total_strat_costs + hstate.total_costs
+    corr_qqq = _corr_with(daily_rets, qqq_rets)
+    beta_qqq = _empirical_beta(daily_rets, qqq_rets)
+    n_trades = len(strat.trades)
+    long_pnl = sum(t["pnl_usd"] for t in strat.trades if t["side"] == 1)
+    total_strat_costs = sum(t.get("costs", 0) for t in strat.trades)
+    total_costs = total_strat_costs + hedge_cost
 
     print(f"\n----- {name} -----")
     print(f"  累计收益    {s['cum']*100:+8.2f}%   "
@@ -515,28 +567,28 @@ def print_variant_summary(name: str, result: BacktestResult, hstate: HedgeState,
           f"MDD {s['mdd']*100:6.2f}%   "
           f"Calmar {s['calmar']:.2f}")
     print(f"  Corr(QQQ)   {corr_qqq:+5.2f}   "
-          f"Beta(QQQ) {beta_qqq:+5.2f}   ", end="")
-    print(f"对冲累计 PnL ${hstate.pnl_dollars:>+10,.0f}   "
-          f"调仓次数 {hstate.rebalance_count}")
+          f"Beta(QQQ) {beta_qqq:+5.2f}   "
+          f"对冲累计 PnL ${hedge_pnl:>+10,.0f}   "
+          f"调仓次数 {rebal_count}")
     print(f"  策略多头交易 {n_trades} 笔, 累计 PnL ${long_pnl:>+10,.0f}   "
           f"策略成本 ${total_strat_costs:>+9,.0f}   "
-          f"对冲成本 ${hstate.total_costs:>+8,.0f}   "
-          f"合计成本 ${total_costs:>+9,.0f} ({total_costs/cfg.starting_capital*100:.1f}%)")
+          f"对冲成本 ${hedge_cost:>+8,.0f}   "
+          f"合计成本 ${total_costs:>+9,.0f} ({total_costs/cfg.starting_capital*100:.1f}%)"
+          + (f"   [bench={bench_label}]" if bench_label else ""))
 
 
 def print_compare_table(rows: List[Tuple[str, dict]]):
-    """rows: [(name, stats_dict), ...]，stats_dict 包含统计指标"""
     headers = ["变体", "累计%", "CAGR%", "Vol%", "Sharpe", "MDD%", "Calmar",
                "Corr(QQQ)", "Beta(QQQ)", "成本%"]
-    print("\n" + "=" * 130)
+    print("\n" + "=" * 132)
     print("                                  对冲变体并排对比")
-    print("=" * 130)
-    fmt = "{:<26s}{:>9}{:>9}{:>9}{:>9}{:>10}{:>9}{:>11}{:>11}{:>9}"
+    print("=" * 132)
+    fmt = "{:<28s}{:>9}{:>9}{:>9}{:>9}{:>10}{:>9}{:>11}{:>11}{:>9}"
     print(fmt.format(*headers))
-    print("-" * 130)
+    print("-" * 132)
     for name, st in rows:
         print(fmt.format(
-            name[:26],
+            name[:28],
             f"{st['cum']*100:+.1f}",
             f"{st['cagr']*100:+.1f}",
             f"{st['vol']*100:.1f}",
@@ -547,30 +599,12 @@ def print_compare_table(rows: List[Tuple[str, dict]]):
             f"{st['beta']:+.2f}",
             f"{st['cost']*100:.1f}",
         ))
-    print("=" * 130)
+    print("=" * 132)
 
 
-def print_yearly_grid(yearly: Dict[str, Dict[int, dict]]):
-    years = sorted({y for v in yearly.values() for y in v.keys()})
-    names = list(yearly.keys())
-    print("\n" + "=" * 96)
-    print("                                  逐年收益% 对比（{} 个变体）".format(len(names)))
-    print("=" * 96)
-    head = "{:<6}".format("年份") + "".join(f"{n[:18]:>20s}" for n in names)
-    print(head)
-    print("-" * 96)
-    for y in years:
-        row = f"{y:<6}"
-        for n in names:
-            d = yearly.get(n, {}).get(y)
-            row += f"{d['ret']:>+19.2f} " if d else f"{'--':>20s}"
-        print(row)
-    print("=" * 96)
-
-
-def _yearly_stats(result: BacktestResult) -> Dict[int, dict]:
-    rets = result.daily_returns.dropna()
-    eq = result.equity
+def _yearly_stats(equity: pd.Series, daily_rets: pd.Series) -> Dict[int, dict]:
+    rets = daily_rets.dropna()
+    eq = equity
     out: Dict[int, dict] = {}
     for y, r in rets.groupby(rets.index.year):
         eq_y = eq.loc[eq.index.year == y]
@@ -582,6 +616,25 @@ def _yearly_stats(result: BacktestResult) -> Dict[int, dict]:
             "sharpe": float(r.mean() * 252 / (sd * np.sqrt(252))) if sd > 1e-12 else 0.0,
         }
     return out
+
+
+def print_yearly_grid(yearly: Dict[str, Dict[int, dict]]):
+    years = sorted({y for v in yearly.values() for y in v.keys()})
+    names = list(yearly.keys())
+    width = 96 if len(names) <= 4 else 96 + (len(names) - 4) * 18
+    print("\n" + "=" * width)
+    print(f"                                  逐年收益% 对比（{len(names)} 个变体）")
+    print("=" * width)
+    head = "{:<6}".format("年份") + "".join(f"{n[:18]:>20s}" for n in names)
+    print(head)
+    print("-" * width)
+    for y in years:
+        row = f"{y:<6}"
+        for n in names:
+            d = yearly.get(n, {}).get(y)
+            row += f"{d['ret']:>+19.2f} " if d else f"{'--':>20s}"
+        print(row)
+    print("=" * width)
 
 
 # ---------------- 主入口 ----------------
@@ -600,7 +653,7 @@ def main():
     cfg = _make_cfg(start_date, end_date)
 
     print("=" * 70)
-    print("  crossrank 对冲实验（DAILY 日 K 模式）")
+    print("  crossrank 对冲实验（DAILY 日 K 模式 - 双账户解耦版）")
     print("=" * 70)
     print(f"  区间        {cfg.start} ~ {cfg.end}")
     print(f"  起始本金    {_fmt_usd(cfg.starting_capital)}")
@@ -617,7 +670,6 @@ def main():
     print("[数据] 构造 DAILY panel...")
     daily_panel = build_daily_panel(data)
 
-    # SPY regime + benchmark
     spy_df = fetch_daily_bars("SPY.US",
                                cfg.start - timedelta(days=400),
                                cfg.end, log_cache=False)
@@ -627,46 +679,63 @@ def main():
     qqq_df = fetch_daily_bars("QQQ.US",
                                cfg.start - timedelta(days=10),
                                cfg.end, log_cache=False)
-    qqq_close = qqq_df["close"]
-    spy_close_ranged = spy_df["close"].loc[
-        (spy_df.index >= pd.Timestamp(cfg.start)) & (spy_df.index <= pd.Timestamp(cfg.end))
-    ]
     qqq_close_ranged = qqq_df["close"].loc[
         (qqq_df.index >= pd.Timestamp(cfg.start)) & (qqq_df.index <= pd.Timestamp(cfg.end))
     ]
-
-    # 不同 instrument 的 close 字典，方便循环
+    spy_close_ranged = spy_df["close"].loc[
+        (spy_df.index >= pd.Timestamp(cfg.start)) & (spy_df.index <= pd.Timestamp(cfg.end))
+    ]
     bench_close_map = {
         "QQQ.US": qqq_close_ranged,
         "SPY.US": spy_close_ranged,
     }
 
-    # ---------- 跑所有变体 ----------
+    # ---------- 跑一次 baseline 多头（所有变体共享）----------
+    print(f"\n========== 跑 baseline 多头层（与 backtest.py DAILY 100% 等价） ==========")
+    strat = run_strategy_baseline(daily_panel, cfg, regime_series=regime_series)
+    print(f"  baseline 多头层完成：{len(strat.trades)} 笔多头交易，"
+          f"终值 {_fmt_usd(strat.equity.iloc[-1])}")
+
+    # ---------- 对每个变体做对冲 overlay（纯后处理） ----------
     rows_for_table: List[Tuple[str, dict]] = []
     yearly_grid: Dict[str, Dict[int, dict]] = {}
-    detailed_results: Dict[str, BacktestResult] = {}
+    detailed_results: Dict[str, Tuple[pd.Series, pd.Series]] = {}
 
     for name, instrument, mode, ratio in HEDGE_VARIANTS:
-        print(f"\n\n========== 跑变体: {name} ==========")
         hcfg = HedgeCfg(name=name, instrument=instrument, mode=mode, ratio=ratio)
-        bclose = bench_close_map.get(instrument) if instrument else None
-        result, hstate, pre_hedge = run_backtest_hedged(
-            daily_panel, cfg, hcfg,
-            regime_series=regime_series,
-            bench_close=bclose,
-        )
-        print_variant_summary(name, result, hstate, cfg, qqq_close_ranged)
+        if hcfg.mode == "none" or hcfg.instrument is None:
+            equity_total = strat.equity
+            daily_rets_total = strat.daily_returns
+            hedge_pnl_total, hedge_cost_total, rebal_count = 0.0, 0.0, 0
+            bench_label = "-"
+        else:
+            bclose = bench_close_map.get(instrument)
+            if bclose is None:
+                print(f"[警告] 未识别的对冲标的 {instrument}，跳过 {name}")
+                continue
+            overlay = simulate_hedge_overlay(strat, bclose, hcfg, cfg)
+            equity_total = overlay.equity_total
+            daily_rets_total = overlay.daily_returns_total
+            hedge_pnl_total = float(overlay.hedge_pnl_cum.iloc[-1])
+            hedge_cost_total = float(overlay.hedge_cost_cum.iloc[-1])
+            rebal_count = overlay.rebalance_count
+            bench_label = instrument
 
-        s = _ann_stats(result.daily_returns)
-        s["corr"] = _corr_with(result.daily_returns, qqq_close_ranged.pct_change())
-        s["beta"] = _empirical_beta(result.daily_returns, qqq_close_ranged.pct_change())
-        s["cost"] = (sum(t.get("costs", 0) for t in result.trades) + hstate.total_costs) \
+        print_variant_summary(name, equity_total, daily_rets_total, strat,
+                               hedge_pnl_total, hedge_cost_total, rebal_count,
+                               cfg, qqq_close_ranged, bench_label=bench_label)
+
+        s = _ann_stats(daily_rets_total, equity=equity_total,
+                       starting=cfg.starting_capital)
+        s["corr"] = _corr_with(daily_rets_total, qqq_close_ranged.pct_change())
+        s["beta"] = _empirical_beta(daily_rets_total, qqq_close_ranged.pct_change())
+        s["cost"] = (sum(t.get("costs", 0) for t in strat.trades) + hedge_cost_total) \
                     / cfg.starting_capital
         rows_for_table.append((name, s))
-        yearly_grid[name] = _yearly_stats(result)
-        detailed_results[name] = result
+        yearly_grid[name] = _yearly_stats(equity_total, daily_rets_total)
+        detailed_results[name] = (equity_total, daily_rets_total)
 
-    # ---------- benchmark QQQ / SPY 自身指标 ----------
+    # ---------- benchmark 对照 ----------
     qqq_rets = qqq_close_ranged.pct_change().dropna()
     spy_rets = spy_close_ranged.pct_change().dropna()
     qqq_stats = _ann_stats(qqq_rets); qqq_stats["corr"] = 1.0; qqq_stats["beta"] = 1.0; qqq_stats["cost"] = 0.0
@@ -674,20 +743,12 @@ def main():
     rows_for_table.append(("(基准) QQQ buy&hold", qqq_stats))
     rows_for_table.append(("(基准) SPY buy&hold", spy_stats))
 
-    # ---------- 打印汇总 ----------
     print_compare_table(rows_for_table)
     print_yearly_grid(yearly_grid)
 
-    # ---------- 重点变体的盈/亏 Top 10（仅 baseline 与最佳对冲） ----------
-    print("\n\n========== 进一步细节：baseline vs 最佳对冲变体 ==========")
-    # 选出 Sharpe 最高的对冲变体（排除 baseline）
-    hedged_rows = [r for r in rows_for_table[1:len(HEDGE_VARIANTS)]]
-    if hedged_rows:
-        best = max(hedged_rows, key=lambda r: r[1]["sharpe"])
-        print(f"\n按 Sharpe 排序，最佳对冲变体：{best[0]}（Sharpe {best[1]['sharpe']:.2f}）")
-        print("baseline 多头交易 Top 5 / 亏损 Top 5：")
-        if "baseline (no hedge)" in detailed_results:
-            print_top_trades(detailed_results["baseline (no hedge)"].trades, n=5)
+    # ---------- 多头交易明细（baseline 共享） ----------
+    print("\n========== baseline 多头交易明细（所有变体共享同一组多头） ==========")
+    print_top_trades(strat.trades, n=5)
 
 
 if __name__ == "__main__":
