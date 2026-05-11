@@ -1,0 +1,83 @@
+{
+  "STX.US": {
+    "symbol": "STX.US",
+    "entry_date": "2026-05-11",
+    "entry_price": 782.64,
+    "stop_price": 718.7052857142857,
+    "shares": 1,
+    "days_held": 0,
+    "last_decision_date": "2026-05-11"
+  },
+  "PWR.US": {
+    "symbol": "PWR.US",
+    "entry_date": "2026-05-11",
+    "entry_price": 745.0,
+    "stop_price": 703.5923928571428,
+    "shares": 1,
+    "days_held": 0,
+    "last_decision_date": "2026-05-11"
+  },
+  "ARM.US": {
+    "symbol": "ARM.US",
+    "entry_date": "2026-05-11",
+    "entry_price": 213.27,
+    "stop_price": 185.88932142857144,
+    "shares": 4,
+    "days_held": 0,
+    "last_decision_date": "2026-05-11"
+  },
+  "ON.US": {
+    "symbol": "ON.US",
+    "entry_date": "2026-05-11",
+    "entry_price": 103.2,
+    "stop_price": 95.54378571428572,
+    "shares": 9,
+    "days_held": 0,
+    "last_decision_date": "2026-05-11"
+  },
+  "WDC.US": {
+    "symbol": "WDC.US",
+    "entry_date": "2026-05-11",
+    "entry_price": 480.0,
+    "stop_price": 437.12367857142857,
+    "shares": 2,
+    "days_held": 0,
+    "last_decision_date": "2026-05-11"
+  },
+  "INTC.US": {
+    "symbol": "INTC.US",
+    "entry_date": "2026-05-11",
+    "entry_price": 124.92,
+    "stop_price": 113.06678571428571,
+    "shares": 7,
+    "days_held": 0,
+    "last_decision_date": "2026-05-11"
+  },
+  "QCOM.US": {
+    "symbol": "QCOM.US",
+    "entry_date": "2026-05-11",
+    "entry_price": 219.09,
+    "stop_price": 197.15742857142857,
+    "shares": 4,
+    "days_held": 0,
+    "last_decision_date": "2026-05-11"
+  },
+  "AMD.US": {
+    "symbol": "AMD.US",
+    "entry_date": "2026-05-11",
+    "entry_price": 455.19,
+    "stop_price": 415.3572857142857,
+    "shares": 2,
+    "days_held": 0,
+    "last_decision_date": "2026-05-11"
+  },
+  "TXN.US": {
+    "symbol": "TXN.US",
+    "entry_date": "2026-05-11",
+    "entry_price": 287.8,
+    "stop_price": 270.47960714285716,
+    "shares": 3,
+    "days_held": 0,
+    "last_decision_date": "2026-05-11"
+  }
+}
