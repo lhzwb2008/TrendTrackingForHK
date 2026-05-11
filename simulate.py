@@ -22,7 +22,8 @@
     python simulate.py                # 守护进程：盘中每分钟检查止损，15:50 决策
     python simulate.py --once         # 立即跑一次决策逻辑（手动触发，调试用）
     python simulate.py --status       # 打印当前 paper 账户持仓与现金、状态文件
-    python simulate.py --cancel-orders # 撤销今日挂单（未终结状态），按当前 .env 账户操作
+    python simulate.py --cancel-orders  # 撤销今日挂单（未终结状态）
+    python simulate.py --prune-state    # 本地状态与券商持仓对齐（撤单后清幽灵记录）
 
 前置：
     .env 中填入 Longport **模拟账号**凭证（LONGPORT_APP_KEY / LONGPORT_APP_SECRET /
@@ -780,7 +781,30 @@ def print_status() -> None:
         print(f"  {sym_label(sym):<22} x{qty:<8} @${px:7.2f}  mv=${mv:>10,.0f}{extra}")
     untracked = set(state.keys()) - set(pos.keys())
     if untracked:
-        print(f"\n本地状态有但 broker 无（待 reconcile）: {untracked}")
+        print(f"\n本地状态有但 broker 无（撤单或未成交后常见）: {untracked}")
+        print("对齐方式: python simulate.py --prune-state")
+
+
+def prune_state_to_match_broker() -> int:
+    """删除本地状态中 broker 已无持仓的记录（不触发交易）。"""
+    broker = Broker()
+    state = load_state()
+    if not state:
+        print("\n本无本地持仓状态，跳过。\n")
+        return 0
+    pos = set(broker.positions().keys())
+    removed: List[str] = []
+    for sym in list(state.keys()):
+        if sym not in pos:
+            state.pop(sym, None)
+            removed.append(sym)
+    if removed:
+        save_state(state)
+        log.info(f"已从 {STATE_FILE} 移除 {len(removed)} 条幽灵记录（broker 无仓）")
+    else:
+        log.info("本地状态与券商持仓一致，未删除条目")
+    print(f"\n已对齐：移除 {len(removed)} 条；剩余本地记录 {len(state)} 条。\n")
+    return len(removed)
 
 
 def main():
@@ -791,6 +815,11 @@ def main():
         "--cancel-orders",
         action="store_true",
         help="撤销当日未终结挂单（市价未触发等）；按 .env 当前密钥对应账户执行",
+    )
+    ap.add_argument(
+        "--prune-state",
+        action="store_true",
+        help="对齐 simulate_state.json：删掉 broker 侧已无持仓本地仍残留的记录（不下单）",
     )
     args = ap.parse_args()
 
@@ -803,6 +832,9 @@ def main():
         broker = Broker()
         n_ok, n_rest = broker.cancel_open_orders_today()
         print(f"\n撤单完成：成功提交 {n_ok} 笔；跳过/失败 {n_rest} 笔。\n")
+        return
+    if args.prune_state:
+        prune_state_to_match_broker()
         return
     if args.status:
         print_status(); return
