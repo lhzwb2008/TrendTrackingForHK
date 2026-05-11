@@ -711,6 +711,21 @@ def _idle_sleep_sec() -> int:
     return int(os.getenv("SIMULATE_IDLE_SLEEP_SEC", "120"))
 
 
+def _sleep_until_stopped(total_sec: float, stopped: Dict[str, bool]) -> None:
+    """分片 sleep，配合 SIGINT/SIGTERM 设置的 stopped['v']，约 1 秒内退出循环。
+
+    长 sleep(120) + 自定义 signal handler 时，部分环境（尤其 SSH）不会立刻打断
+    阻塞，看起来 Ctrl+C「无效」；拆成 1s 片即可恢复预期行为。
+    """
+    if total_sec <= 0:
+        return
+    deadline = time.monotonic() + total_sec
+    while time.monotonic() < deadline:
+        if stopped["v"]:
+            return
+        time.sleep(min(1.0, deadline - time.monotonic()))
+
+
 def loop() -> None:
     broker = Broker()
     state = load_state()
@@ -741,7 +756,7 @@ def loop() -> None:
                     f"周{wd}），{idle_sec}s 后再检查；盘中为每分钟止损 + "
                     f"{DECISION_TIME_ET} 决策。"
                 )
-                time.sleep(idle_sec)
+                _sleep_until_stopped(float(idle_sec), stopped)
                 continue
 
             check_stops(broker, state)
@@ -754,10 +769,10 @@ def loop() -> None:
                 run_decision(broker, state)
                 last_decision_date = today_d
 
-            time.sleep(60)
+            _sleep_until_stopped(60.0, stopped)
         except Exception as e:
             log.exception(f"循环异常，60s 后重试: {e}")
-            time.sleep(60)
+            _sleep_until_stopped(60.0, stopped)
     log.info("收到退出信号，已停止")
 
 
