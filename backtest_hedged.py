@@ -32,20 +32,16 @@ from __future__ import annotations
 #                              用户可调参数
 # ============================================================================
 
-# ---- 区间（沿用主 backtest 的 DAILY 区间） ----
-DAILY_START   = "2020-01-01"
-BACKTEST_END  = "today"
+# ---- 区间：默认跑近 10 年（Longport 日 K 数据有多少用多少） ----
+DAILY_START   = "2016-05-01"
+BACKTEST_END  = "2026-05-01"
 STARTING_CAPITAL = 100_000
 
-# 默认只跑 baseline + 最佳推荐（rolling-beta QQQ 0.5x）。
-# 经过完整扫描，rolling-beta QQQ 0.5x 是「调平 + 保留 alpha」的最佳折中。
-# 如需做参数扫描，把列表替换/扩充为多组 (name, instrument, mode, ratio)。
+# 默认对比 baseline + 两档 QQQ 滚动 beta 对冲（0.5x = 半对冲、1.0x = 严格 zero-beta）
 HEDGE_VARIANTS = [
     ("baseline (no hedge)",     None,      "none",          0.0),
     ("rolling-beta QQQ 0.5x",   "QQQ.US",  "rolling_beta",  0.5),
-    # 候选备选（默认注释；按需打开做对照）：
-    # ("rolling-beta QQQ 1.0x", "QQQ.US",  "rolling_beta",  1.0),    # 严格 zero-beta
-    # ("static QQQ 0.5x",       "QQQ.US",  "static",        0.5),    # 简单不动 beta 的对照
+    ("rolling-beta QQQ 1.0x",   "QQQ.US",  "rolling_beta",  1.0),
 ]
 
 # 滚动 beta 估计窗口
@@ -682,13 +678,7 @@ def main():
     qqq_close_ranged = qqq_df["close"].loc[
         (qqq_df.index >= pd.Timestamp(cfg.start)) & (qqq_df.index <= pd.Timestamp(cfg.end))
     ]
-    spy_close_ranged = spy_df["close"].loc[
-        (spy_df.index >= pd.Timestamp(cfg.start)) & (spy_df.index <= pd.Timestamp(cfg.end))
-    ]
-    bench_close_map = {
-        "QQQ.US": qqq_close_ranged,
-        "SPY.US": spy_close_ranged,
-    }
+    bench_close_map = {"QQQ.US": qqq_close_ranged}
 
     # ---------- 跑一次 baseline 多头（所有变体共享）----------
     print(f"\n========== 跑 baseline 多头层（与 backtest.py DAILY 100% 等价） ==========")
@@ -737,11 +727,8 @@ def main():
 
     # ---------- benchmark 对照 ----------
     qqq_rets = qqq_close_ranged.pct_change().dropna()
-    spy_rets = spy_close_ranged.pct_change().dropna()
     qqq_stats = _ann_stats(qqq_rets); qqq_stats["corr"] = 1.0; qqq_stats["beta"] = 1.0; qqq_stats["cost"] = 0.0
-    spy_stats = _ann_stats(spy_rets); spy_stats["corr"] = _corr_with(spy_rets, qqq_rets); spy_stats["beta"] = _empirical_beta(spy_rets, qqq_rets); spy_stats["cost"] = 0.0
     rows_for_table.append(("(基准) QQQ buy&hold", qqq_stats))
-    rows_for_table.append(("(基准) SPY buy&hold", spy_stats))
 
     print_compare_table(rows_for_table)
     print_yearly_grid(yearly_grid)
