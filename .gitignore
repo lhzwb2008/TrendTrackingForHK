@@ -113,6 +113,11 @@ data_cache/
 *.pkl
 *.pickle
 
+# Runtime state / logs (simulate.py per-environment, do not share)
+simulate_state.json
+simulate_state.json.tmp
+simulate.log
+
 # IDE
 .vscode/
 .idea/
