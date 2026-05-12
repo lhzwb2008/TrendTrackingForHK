@@ -416,6 +416,18 @@ class Broker:
             log.warning(f"读取账户余额失败: {e}")
         return 0.0
 
+    def total_equity_usd(self) -> float:
+        """USD 净资产（含持仓市值）。用于按 K_LONG 等权计算每仓目标 notional。"""
+        try:
+            bals = self.trade_ctx.account_balance(currency="USD")
+            for b in bals:
+                v = float(getattr(b, "net_assets", 0) or 0)
+                if v > 0:
+                    return v
+        except Exception as e:
+            log.warning(f"读取账户净资产失败: {e}")
+        return 0.0
+
     def positions(self) -> Dict[str, float]:
         out: Dict[str, float] = {}
         try:
@@ -643,12 +655,22 @@ def run_decision(broker: Broker, state: Dict[str, LocalPosition],
 
     # 开仓
     cash = broker.cash_usd()
-    log.info(f"可用现金 ≈ ${cash:,.0f}")
+    equity = broker.total_equity_usd() or cash  # 净资产兜底用现金
+    log.info(f"可用现金 ≈ ${cash:,.0f}, 净资产 ≈ ${equity:,.0f}")
     if cash <= 100 or not to_open:
         save_state(state); return
 
-    open_slots = K_LONG - len(state)
-    per_pos_usd = cash / max(open_slots, 1)
+    # 每个仓位的目标 notional = 净资产 / K_LONG（等同回测里的 equity * (1/K)），
+    # 再用 (现金 / 剩余空位 × 0.97 buffer) 兜底，避免单笔超过 buying power。
+    target_per_pos = equity / max(K_LONG, 1)
+    open_slots = max(K_LONG - len(state), 1)
+    cash_cap_per_pos = (cash * 0.97) / open_slots
+    per_pos_usd = min(target_per_pos, cash_cap_per_pos)
+    log.info(
+        f"每仓 notional 上限 ≈ ${per_pos_usd:,.0f} "
+        f"(target ${target_per_pos:,.0f}, cash_cap ${cash_cap_per_pos:,.0f}, "
+        f"open_slots={open_slots})"
+    )
     for sym in to_open:
         row = day_panel.loc[sym]
         atr = float(row["atr14"])
