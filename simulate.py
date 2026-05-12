@@ -509,24 +509,76 @@ class Broker:
 
     def submit_market(self, symbol: str, side: str, qty: int,
                       remark: str = "") -> Optional[str]:
-        from longport.openapi import OrderType, OrderSide, TimeInForceType
+        """时段感知下单：
+
+        - RTH (09:30–16:00 ET) → 市价单 MO（默认 RTHOnly）
+        - 夜盘 (周日–周四 20:00 ET ~ 次日 03:50 ET) → LO + OutsideRTH=Overnight，
+          限价为 mkt × 1.05（买）或 × 0.95（卖），确保深度对价成交
+        - 其它时段（盘前 04:00–09:30、盘后 16:00–20:00） → LO + OutsideRTH=AnyTime，
+          同上限价策略
+
+        注意：Longport 文档明示「MO 仅支持 RTH，会忽略 outside_rth」，因此非 RTH
+        必须改用限价单 + outside_rth 才能成交。
+        """
+        from longport.openapi import OrderType, OrderSide, TimeInForceType, OutsideRTH
+        from decimal import ROUND_HALF_UP
         if qty <= 0:
             return None
         side_enum = OrderSide.Buy if side == "buy" else OrderSide.Sell
-        try:
-            resp = self.trade_ctx.submit_order(
-                symbol=symbol,
-                order_type=OrderType.MO,
-                side=side_enum,
-                submitted_quantity=Decimal(int(qty)),
-                time_in_force=TimeInForceType.Day,
-                remark=remark[:64] if remark else None,
+
+        now_et = pd.Timestamp.now(tz="UTC").tz_convert(ET_TZ)
+        t = now_et.time()
+        wd = now_et.weekday()  # 0=Mon
+        rth_open  = datetime.strptime("09:30", "%H:%M").time()
+        rth_close = datetime.strptime("16:00", "%H:%M").time()
+        on_open   = datetime.strptime("20:00", "%H:%M").time()
+        on_close  = datetime.strptime("03:50", "%H:%M").time()
+
+        in_rth = wd < 5 and rth_open <= t <= rth_close
+        # Overnight: 周日–周四 20:00–次日 03:50；映射到本地 wd：周一凌晨 (wd=0, t<03:50)
+        # 或 周日–周四晚 (wd in 6,0..3, t>=20:00)
+        in_overnight_late = wd in (6, 0, 1, 2, 3) and t >= on_open
+        in_overnight_early = wd in (0, 1, 2, 3, 4) and t < on_close
+        in_overnight = in_overnight_late or in_overnight_early
+
+        params: Dict = {
+            "symbol": symbol,
+            "side": side_enum,
+            "submitted_quantity": Decimal(int(qty)),
+            "time_in_force": TimeInForceType.Day,
+            "remark": remark[:64] if remark else None,
+        }
+
+        if in_rth:
+            params["order_type"] = OrderType.MO
+            mode = "MO/RTH"
+        else:
+            # 非 RTH：用 LO + outside_rth
+            px = self.last_price(symbol)
+            if not px or px <= 0:
+                log.error(f"  ✗ {side} {symbol}: 非 RTH 时段需要现价计算限价，但报价为空")
+                return None
+            mult = 1.05 if side_enum == OrderSide.Buy else 0.95
+            limit = Decimal(str(px * mult)).quantize(
+                Decimal("0.01"), rounding=ROUND_HALF_UP,
             )
+            params["order_type"] = OrderType.LO
+            params["submitted_price"] = limit
+            if in_overnight:
+                params["outside_rth"] = OutsideRTH.Overnight
+                mode = f"LO/Overnight @${limit}"
+            else:
+                params["outside_rth"] = OutsideRTH.AnyTime
+                mode = f"LO/AnyTime @${limit}"
+
+        try:
+            resp = self.trade_ctx.submit_order(**params)
             oid = getattr(resp, "order_id", None) or str(resp)
-            log.info(f"  → {side.upper()} {sym_label(symbol)} x{qty}  id={oid}  ({remark})")
+            log.info(f"  → {side.upper()} {sym_label(symbol)} x{qty}  {mode}  "
+                     f"id={oid}  ({remark})")
             return oid
         except Exception as e:
-            log.error(f"  ✗ 下单失败 {side} {symbol} x{qty}: {e}")
+            log.error(f"  ✗ 下单失败 {side} {symbol} x{qty} ({mode}): {e}")
             return None
 
 
